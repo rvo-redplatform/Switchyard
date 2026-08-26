@@ -10,7 +10,7 @@ use opentelemetry::{Array as OtelArray, StringValue, Value as OtelValue};
 use switchyard_libsy::{LibsyError, Result};
 use switchyard_protocol::{
     AggLlmResponse, LlmClientError, LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream,
-    LlmResponseStreamEvent, Response, StopReason, Usage,
+    LlmResponseStreamEvent, Message, Response, ResponseAccumulator, StopReason, Usage,
 };
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -42,6 +42,18 @@ pub(crate) fn record_gen_ai_request(span: &Span, request: &LlmRequest) {
         .and_then(gen_ai_output_type)
     {
         span.record("gen_ai.output.type", value);
+    }
+    record_gen_ai_prompt(span, &request.messages);
+}
+
+/// Records the request's messages as a JSON string, matching Langfuse's OTel
+/// attribute mapping for observation input (`gen_ai.prompt`).
+fn record_gen_ai_prompt(span: &Span, messages: &[Message]) {
+    if messages.is_empty() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(messages) {
+        span.record("gen_ai.prompt", json);
     }
 }
 
@@ -78,6 +90,7 @@ fn observe_client_stream(stream: LlmResponseStream, span: Span) -> LlmResponseSt
         observer: Some(ClientStreamObserver {
             span,
             outcome: Outcome::Open,
+            accumulator: ResponseAccumulator::new(),
         }),
     })
 }
@@ -94,6 +107,18 @@ fn record_gen_ai_response(span: &Span, response: &AggLlmResponse) {
             .map(stop_reason_name),
     );
     record_gen_ai_usage(span, &response.usage);
+    record_gen_ai_completion(span, response);
+}
+
+/// Records the response's output content as a JSON string, matching Langfuse's
+/// OTel attribute mapping for observation output (`gen_ai.completion`).
+fn record_gen_ai_completion(span: &Span, response: &AggLlmResponse) {
+    if response.outputs.is_empty() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(&response.outputs) {
+        span.record("gen_ai.completion", json);
+    }
 }
 
 fn record_gen_ai_usage(span: &Span, usage: &Usage) {
@@ -246,6 +271,7 @@ enum Outcome {
 struct ClientStreamObserver {
     span: Span,
     outcome: Outcome,
+    accumulator: ResponseAccumulator,
 }
 
 impl ClientStreamObserver {
@@ -274,6 +300,7 @@ impl ClientStreamObserver {
     }
 
     fn observe_chunk(&mut self, chunk: &LlmResponseChunk) {
+        self.accumulator.push(chunk.clone());
         match chunk {
             LlmResponseChunk::MessageStart { id, model } => {
                 record_optional(&self.span, "gen_ai.response.id", id.as_deref());
@@ -301,6 +328,8 @@ impl ClientStreamObserver {
         if self.outcome == Outcome::Open {
             self.span.record("outcome", "ok");
             self.outcome = Outcome::Completed;
+            let response = std::mem::take(&mut self.accumulator).finish();
+            record_gen_ai_completion(&self.span, &response);
         }
     }
 }
