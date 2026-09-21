@@ -62,6 +62,11 @@ pub(crate) fn request_span(headers: &HeaderMap) -> tracing::Span {
         // input/output, which map from these attributes.
         gen_ai.prompt = tracing::field::Empty,
         gen_ai.completion = tracing::field::Empty,
+        // Terminal status so Langfuse flags the trace itself, not only the nested
+        // generation observation, when the request fails.
+        outcome = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error = tracing::field::Empty,
         // Shared route-selection vocabulary. Names must match GenericKeys / LangfuseKeys.
         switchyard.route.id = tracing::field::Empty,
         switchyard.routing.algorithm = tracing::field::Empty,
@@ -194,6 +199,15 @@ pub(crate) fn record_root_output(span: &tracing::Span, response: &Response) {
             span.record("gen_ai.completion", json);
         }
     }
+}
+
+/// Marks the root span as failed so Langfuse flags the trace itself, not only the
+/// nested `libsy.client_call` generation observation. Call this on the request
+/// handler's error paths before returning, since the span closes on return.
+pub(crate) fn record_root_error(span: &tracing::Span, error: &dyn std::fmt::Display) {
+    span.record("outcome", "error");
+    span.record("otel.status_code", "ERROR");
+    span.record("error", tracing::field::display(error));
 }
 
 struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -482,7 +496,7 @@ mod tests {
     use tracing_subscriber::Layer;
     use tracing_subscriber::registry::LookupSpan;
 
-    use super::{record_root_outcome, record_root_route_context};
+    use super::{record_root_error, record_root_outcome, record_root_route_context};
     use switchyard_protocol::{GenericKeys, LangfuseKeys, ResponseOrigin};
 
     #[derive(Clone, Default)]
@@ -595,7 +609,13 @@ mod tests {
     #[test]
     fn successful_request_summarizes_matching_selected_and_served_target() {
         let span = capture_root(|span| {
-            record_root_route_context(span, Some("auto"), "random", Some("session-1"), Some("user-1"));
+            record_root_route_context(
+                span,
+                Some("auto"),
+                "random",
+                Some("session-1"),
+                Some("user-1"),
+            );
             record_root_outcome(span, "primary", Some("primary"));
         });
         assert_route_context(&span, "auto", "random", "session-1");
@@ -624,7 +644,13 @@ mod tests {
     #[test]
     fn fallback_success_keeps_selected_target_distinct_from_served() {
         let span = capture_root(|span| {
-            record_root_route_context(span, Some("auto"), "llm_task_classifier", Some("session-2"), Some("user-2"));
+            record_root_route_context(
+                span,
+                Some("auto"),
+                "llm_task_classifier",
+                Some("session-2"),
+                Some("user-2"),
+            );
             record_root_outcome(span, "weak", Some("strong"));
         });
         assert_route_context(&span, "auto", "llm_task_classifier", "session-2");
@@ -651,7 +677,13 @@ mod tests {
     #[test]
     fn routing_generated_response_does_not_claim_a_target_served_it() {
         let span = capture_root(|span| {
-            record_root_route_context(span, Some("auto"), "noop", Some("session-3"), Some("user-3"));
+            record_root_route_context(
+                span,
+                Some("auto"),
+                "noop",
+                Some("session-3"),
+                Some("user-3"),
+            );
             record_root_outcome(span, "auto", None);
         });
         assert_route_context(&span, "auto", "noop", "session-3");
@@ -674,7 +706,13 @@ mod tests {
     #[test]
     fn execute_failure_does_not_fabricate_a_terminal_outcome() {
         let span = capture_root(|span| {
-            record_root_route_context(span, Some("auto"), "random", Some("session-4"), Some("user-4"));
+            record_root_route_context(
+                span,
+                Some("auto"),
+                "random",
+                Some("session-4"),
+                Some("user-4"),
+            );
         });
         assert_route_context(&span, "auto", "random", "session-4");
         assert_absent(&span, GenericKeys::SELECTED_TARGET);
@@ -686,9 +724,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_request_marks_the_root_span_error() {
+        let span = capture_root(|span| {
+            record_root_error(span, &"upstream timeout");
+        });
+        assert_eq!(
+            span.fields.get("otel.status_code").map(String::as_str),
+            Some("ERROR")
+        );
+        assert_eq!(
+            span.fields.get("outcome").map(String::as_str),
+            Some("error")
+        );
+        assert!(span.fields.contains_key("error"));
+    }
+
+    #[test]
     fn present_user_id_records_langfuse_user_id_on_root_span() {
         let span = capture_root(|span| {
-            record_root_route_context(span, Some("auto"), "random", Some("session-1"), Some("kcasamento"));
+            record_root_route_context(
+                span,
+                Some("auto"),
+                "random",
+                Some("session-1"),
+                Some("kcasamento"),
+            );
         });
         assert_eq!(
             span.fields.get(LangfuseKeys::USER_ID).map(String::as_str),

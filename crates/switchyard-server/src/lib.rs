@@ -826,7 +826,10 @@ async fn handle_llm_request(
     );
     let output = match route.execute(request, Some(observer)).await {
         Ok(output) => output,
-        Err(error) => return runner_error(error),
+        Err(error) => {
+            observability::record_root_error(&span, &error);
+            return runner_error(error);
+        }
     };
     let RunOutput {
         selected_model,
@@ -865,7 +868,10 @@ async fn handle_llm_request(
     let mut response =
         match into_http_response(response, wire_format, response_model, request_extensions) {
             Ok(response) => response,
-            Err(error) => return server_error(error.to_string()),
+            Err(error) => {
+                observability::record_root_error(&span, &error);
+                return server_error(error.to_string());
+            }
         };
     if let Some(served_model) = served_model.as_ref() {
         attach_routing_headers(&mut response, served_model.as_str());

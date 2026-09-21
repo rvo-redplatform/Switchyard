@@ -352,6 +352,22 @@ mod tests {
     use switchyard_protocol::{Metadata, Request, completion_text, text_request};
     use tracing_subscriber::Layer;
 
+    // tracing's subscriber is process-global; install a capture layer once so
+    // the global subscriber is never changed mid-run. Tests use unique
+    // algorithm names and filter spans by algorithm, so a shared store does not
+    // mix their results.
+    static CAPTURE_STORE: std::sync::LazyLock<CaptureStore> =
+        std::sync::LazyLock::new(CaptureStore::default);
+    static _SUBSCRIBER: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
+            store: CAPTURE_STORE.clone(),
+        });
+        // set_global_default is process-global and cannot be undone, so it
+        // must be called exactly once.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("failed to set global default subscriber");
+    });
+
     const PROMPT: &str = "SECRET_PROMPT_DO_NOT_PROMOTE";
     const EXTRA_KEY: &str = "secret_key";
     const EXTRA_VALUE: &str = "secret-value";
@@ -479,13 +495,11 @@ mod tests {
         algorithm: Arc<dyn Algorithm>,
         request: Request,
     ) -> Result<Vec<SpanRecord>> {
-        let store = CaptureStore::default();
-        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
-            store: store.clone(),
-        });
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // Use the one shared subscriber; spans are filtered by algorithm, so
+        // concurrent tests don't mix results.
+        let _ = &*_SUBSCRIBER;
         test_drive(algorithm, request, echo()).await?;
-        Ok(store.spans())
+        Ok(CAPTURE_STORE.spans())
     }
 
     /// Calls one model during routing and returns that model as the answer.
@@ -548,7 +562,7 @@ mod tests {
 
     /// Normal success: both spans carry the shared vocabulary, existing fields
     /// remain, and neither extra metadata keys nor request content become attributes.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn successful_run_emits_shared_vocabulary_without_promoting_content() -> Result<()> {
         const ALGO: &str = "vocab-success";
         const TARGET: &str = "vocab-success-target";
@@ -636,8 +650,11 @@ mod tests {
     /// Fallback success: the run span keeps the selected target after the host
     /// serves a different fallback, while the internal call is tagged as a
     /// routing dependency against the judge.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn fallback_success_keeps_selected_target_distinct_from_served() -> Result<()> {
+        // Use the one shared subscriber; spans are filtered by algorithm, so
+        // concurrent tests don't mix results.
+        let _ = &*_SUBSCRIBER;
         const ALGO: &str = "vocab-fallback";
         const JUDGE: &str = "vocab-judge";
         const SELECTED: &str = "vocab-selected";
@@ -648,11 +665,6 @@ mod tests {
             selected: SELECTED.into(),
             fallback: FALLBACK.into(),
         });
-        let store = CaptureStore::default();
-        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
-            store: store.clone(),
-        });
-        let _guard = tracing::subscriber::set_default(subscriber);
         let outcome = crate::drive(
             algorithm,
             request_with(Some("session-2"), None),
@@ -684,7 +696,7 @@ mod tests {
             FALLBACK
         );
 
-        let spans = store.spans();
+        let spans = CAPTURE_STORE.spans();
         let run = find_span(&spans, "libsy.run", ALGO);
         assert_pair(
             run,
@@ -717,7 +729,7 @@ mod tests {
 
     /// An empty session is kept off langfuse.session.id; existing session fields
     /// still record the empty string.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn empty_session_is_not_promoted() -> Result<()> {
         const ALGO: &str = "vocab-empty-session";
         const TARGET: &str = "vocab-empty-target";
