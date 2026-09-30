@@ -74,9 +74,7 @@ jobs:
             type=ref,event=branch
             type=semver,pattern=v{{version}}
             type=sha,prefix=sha-,format=short
-            {{- if inputs.tag }}
-            custom:${{ inputs.tag }}
-            {{- end }}
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
