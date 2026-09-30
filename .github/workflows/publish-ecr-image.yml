@@ -32,13 +32,13 @@ on:
         default: ""
 
 permissions:
-  id-token: write   # required for OIDC token exchange
+  id-token: write # required for OIDC token exchange
   contents: read
 
 env:
-  AWS_REGION:       us-east-1
-  AWS_ACCOUNT_ID:   "803669523933"
-  ECR_REPO:         rp-switchyard
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "543248655649"
+  ECR_REPO: ai-gateway/switchyard-server
 
 jobs:
   build-and-push:
