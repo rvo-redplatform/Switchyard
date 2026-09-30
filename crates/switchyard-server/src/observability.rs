@@ -7,10 +7,10 @@ use std::env;
 use std::sync::OnceLock;
 
 use axum::http::HeaderMap;
-use opentelemetry::propagation::{Extractor, TextMapPropagator};
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::trace::{
+    SpanContext, SpanId, TracerProvider as _, TraceFlags, TraceId, TraceState,
+};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use switchyard_protocol::{
     GenericKeys, LangfuseKeys, LlmRequest, LlmResponse, Response, ResponseOrigin,
@@ -50,9 +50,12 @@ pub fn flush_observability() {
     metrics::flush();
 }
 
-/// Creates the server request span with any incoming W3C trace context as its parent.
+/// Creates the server request span as a fresh trace root.
+///
+/// The span starts its own trace instead of adopting the client's incoming W3C `traceparent`
+/// as its parent, so each request appears as a named, independent trace in Langfuse. When the
+/// caller sent trace context, the incoming context is preserved as a cross-trace link.
 pub(crate) fn request_span(headers: &HeaderMap) -> tracing::Span {
-    let parent = TraceContextPropagator::new().extract(&HeaderExtractor(headers));
     let span = tracing::info_span!(
         target: "switchyard_server",
         "switchyard.request",
@@ -81,8 +84,39 @@ pub(crate) fn request_span(headers: &HeaderMap) -> tracing::Span {
         langfuse.observation.metadata.switchyard.served_target = tracing::field::Empty,
         langfuse.observation.metadata.switchyard.response_origin = tracing::field::Empty,
     );
-    let _ = span.set_parent(parent);
+    // Record the incoming trace as a cross-trace link rather than a parent, so this span
+    // stays a root while the upstream trace is still correlated.
+    if let Some(context) = incoming_trace_context(headers) {
+        span.add_link(context);
+    }
     span
+}
+
+/// Parses the incoming W3C `traceparent` header into a remote [`SpanContext`] for linking.
+///
+/// Returns `None` when the header is absent or malformed so a bad incoming trace never
+/// blocks the request. Only the current `00` version is honored, and the context must be
+/// valid (non-zero ids) before it is linked.
+fn incoming_trace_context(headers: &HeaderMap) -> Option<SpanContext> {
+    let traceparent = headers.get("traceparent").and_then(|value| value.to_str().ok())?;
+    let parts: Vec<&str> = traceparent.split('-').collect();
+    let [version, trace_id, span_id, trace_flags] = parts.as_slice() else {
+        return None;
+    };
+    if *version != "00" {
+        return None;
+    }
+    let trace_id = TraceId::from_hex(trace_id).ok()?;
+    let span_id = SpanId::from_hex(span_id).ok()?;
+    let trace_flags = u8::from_str_radix(trace_flags, 16).ok()?;
+    let context = SpanContext::new(
+        trace_id,
+        span_id,
+        TraceFlags::new(trace_flags),
+        true,
+        TraceState::NONE,
+    );
+    context.is_valid().then_some(context)
 }
 
 /// Records the request's messages on the root span so Langfuse populates trace-level input.
@@ -210,18 +244,6 @@ pub(crate) fn record_root_error(span: &tracing::Span, error: &dyn std::fmt::Disp
     span.record("error", tracing::field::display(error));
 }
 
-struct HeaderExtractor<'a>(&'a HeaderMap);
-
-impl Extractor for HeaderExtractor<'_> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|value| value.to_str().ok())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|name| name.as_str()).collect()
-    }
-}
-
 pub(crate) fn otlp_enabled(signal: &str) -> bool {
     if env_var_is_true("OTEL_SDK_DISABLED") {
         return false;
@@ -312,40 +334,64 @@ fn env_var_is_true(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
-    use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
+    use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;
-    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
     use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt as _};
 
     use super::request_span;
 
     #[test]
-    fn request_span_continues_incoming_w3c_trace_context() {
-        let provider = SdkTracerProvider::builder().build();
+    fn request_span_starts_a_fresh_trace_and_links_the_incoming_context() {
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
         let tracer = provider.tracer("request-span-test");
         let subscriber =
             tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
         let mut headers = HeaderMap::new();
         headers.insert(
             "traceparent",
             HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
         );
-        headers.insert(
-            "tracestate",
-            HeaderValue::from_static("vendor=opaque-value"),
-        );
 
         tracing::subscriber::with_default(subscriber, || {
-            let span = request_span(&headers);
-            let context = span.context();
-            let current = context.span();
-            let span_context = current.span_context();
-            assert_eq!(
-                span_context.trace_id().to_string(),
-                "4bf92f3577b34da6a3ce929d0e0e4736"
-            );
-            assert_eq!(span_context.trace_state().header(), "vendor=opaque-value");
+            let _span = request_span(&headers);
         });
+
+        let spans = exporter.get_finished_spans().expect("failed to get spans");
+        let root_span = spans
+            .iter()
+            .find(|span| span.name == "switchyard.request")
+            .expect("no switchyard.request span");
+
+        // The request span starts its own trace rather than continuing the incoming trace.
+        assert!(
+            root_span.span_context.is_valid(),
+            "root span must have a valid (non-zero) trace id"
+        );
+        assert_ne!(
+            root_span.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "the request span must not adopt the incoming trace id"
+        );
+
+        // The incoming W3C context is preserved as a cross-trace link.
+        let link = root_span
+            .links
+            .links
+            .iter()
+            .find(|link| {
+                link.span_context.trace_id().to_string() == "4bf92f3577b34da6a3ce929d0e0e4736"
+            })
+            .expect("incoming trace context should be recorded as a link");
+        assert_eq!(
+            link.span_context.span_id().to_string(),
+            "00f067aa0ba902b7"
+        );
     }
 
     #[test]
