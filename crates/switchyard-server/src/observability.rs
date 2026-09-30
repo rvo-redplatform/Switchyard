@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use axum::http::HeaderMap;
 use opentelemetry::trace::{
-    SpanContext, SpanId, TracerProvider as _, TraceFlags, TraceId, TraceState,
+    SpanContext, SpanId, TraceFlags, TraceId, TraceState, TracerProvider as _,
 };
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -98,7 +98,9 @@ pub(crate) fn request_span(headers: &HeaderMap) -> tracing::Span {
 /// blocks the request. Only the current `00` version is honored, and the context must be
 /// valid (non-zero ids) before it is linked.
 fn incoming_trace_context(headers: &HeaderMap) -> Option<SpanContext> {
-    let traceparent = headers.get("traceparent").and_then(|value| value.to_str().ok())?;
+    let traceparent = headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())?;
     let parts: Vec<&str> = traceparent.split('-').collect();
     let [version, trace_id, span_id, trace_flags] = parts.as_slice() else {
         return None;
@@ -388,10 +390,7 @@ mod tests {
                 link.span_context.trace_id().to_string() == "4bf92f3577b34da6a3ce929d0e0e4736"
             })
             .expect("incoming trace context should be recorded as a link");
-        assert_eq!(
-            link.span_context.span_id().to_string(),
-            "00f067aa0ba902b7"
-        );
+        assert_eq!(link.span_context.span_id().to_string(), "00f067aa0ba902b7");
     }
 
     #[test]
