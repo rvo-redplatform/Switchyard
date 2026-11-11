@@ -195,6 +195,10 @@ pub(crate) fn fall_open_tier(state: &State) -> Option<Tier> {
 
 /// Record which component decided the turn.
 pub(crate) fn record_decision_source(state: &mut State, source: DecisionSource) {
+    crate::observability::record_routing(
+        switchyard_protocol::RoutingDecisionKeys::DECIDED_BY,
+        source.as_str(),
+    );
     state.extra.insert(
         DECISION_SOURCE_KEY.to_string(),
         StateValue::String(source.as_str().to_string()),
@@ -637,6 +641,14 @@ impl Classifier<State> for StageClassifier {
                 // Prefer pick_tier's own confidence (e.g. 1.0 for an Override)
                 // over re-deriving it from the neutral 0.5 placeholder.
                 let conf = confidence.unwrap_or_else(|| 2.0 * (probability - 0.5).abs());
+                crate::observability::record_routing(
+                    switchyard_protocol::RoutingDecisionKeys::STAGE_PROBABILITY,
+                    probability,
+                );
+                crate::observability::record_routing(
+                    switchyard_protocol::RoutingDecisionKeys::STAGE_CONFIDENCE,
+                    conf,
+                );
                 Ok((
                     Classification::Scores(vec![Score {
                         target: target.clone(),
