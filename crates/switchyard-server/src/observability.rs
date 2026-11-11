@@ -4,6 +4,7 @@
 //! Process-wide tracing and OpenTelemetry setup for server hosts.
 
 use std::env;
+use std::fmt;
 use std::sync::OnceLock;
 
 use axum::http::HeaderMap;
@@ -15,7 +16,11 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use switchyard_protocol::{
     GenericKeys, LangfuseKeys, LlmRequest, LlmResponse, Response, ResponseOrigin,
 };
+use tracing::field::{Field, Visit};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing_subscriber::field::{RecordFields, VisitOutput as _};
+use tracing_subscriber::fmt::format::{DefaultVisitor, Format, Writer};
+use tracing_subscriber::fmt::{FormatFields, FormattedFields, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
@@ -284,10 +289,7 @@ fn initialize() -> Result<Observability, String> {
         .then(build_tracer_provider)
         .transpose()?;
     let filter = log_filter()?;
-    let format = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(std::io::stderr)
-        .with_filter(filter);
+    let format = format_layer(std::io::stderr).with_filter(filter);
 
     if let Some(provider) = &tracer_provider {
         let tracer = provider.tracer("switchyard");
@@ -308,6 +310,109 @@ fn initialize() -> Result<Observability, String> {
     }
 
     Ok(Observability { tracer_provider })
+}
+
+/// Builds the human-readable log layer that writes to `writer` (stderr in production).
+///
+/// The layer formats span and event fields with [`ContentRedactingFields`], so message
+/// content recorded on spans (`gen_ai.prompt`, `gen_ai.completion`, ...) never reaches the
+/// container log. The OpenTelemetry layer records fields with its own visitor, so OTLP spans
+/// still carry the content.
+fn format_layer<S, W>(
+    writer: W,
+) -> tracing_subscriber::fmt::Layer<S, ContentRedactingFields, Format, W>
+where
+    W: for<'writer> MakeWriter<'writer> + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .fmt_fields(ContentRedactingFields)
+        .with_ansi(false)
+        .with_writer(writer)
+}
+
+/// Exact field names that carry prompt, completion, instruction, or tool content.
+const CONTENT_FIELDS: &[&str] = &[
+    "gen_ai.prompt",
+    "gen_ai.completion",
+    "gen_ai.input.messages",
+    "gen_ai.output.messages",
+    "gen_ai.system_instructions",
+    "gen_ai.tool.definitions",
+    "gen_ai.tool.call.arguments",
+    "gen_ai.tool.call.result",
+    "input.value",
+    "output.value",
+    "langfuse.observation.input",
+    "langfuse.observation.output",
+    "langfuse.trace.input",
+    "langfuse.trace.output",
+];
+
+/// Field-name prefixes for indexed or nested content keys (OpenInference, legacy semconv).
+const CONTENT_FIELD_PREFIXES: &[&str] = &[
+    "gen_ai.prompt.",
+    "gen_ai.completion.",
+    "llm.input_messages",
+    "llm.output_messages",
+    "llm.prompts",
+    "llm.tools",
+];
+
+/// Reports whether a tracing field carries request or response content.
+fn is_content_field(name: &str) -> bool {
+    CONTENT_FIELDS.contains(&name)
+        || CONTENT_FIELD_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// Field formatter for the log layer: the default `key=value` format, minus content fields.
+#[derive(Debug, Clone, Copy, Default)]
+struct ContentRedactingFields;
+
+impl<'writer> FormatFields<'writer> for ContentRedactingFields {
+    fn format_fields<R: RecordFields>(&self, writer: Writer<'writer>, fields: R) -> fmt::Result {
+        let mut visitor = ContentRedactingVisitor(DefaultVisitor::new(writer, true));
+        fields.record(&mut visitor);
+        visitor.0.finish()
+    }
+
+    fn add_fields(
+        &self,
+        current: &'writer mut FormattedFields<Self>,
+        fields: &tracing::span::Record<'_>,
+    ) -> fmt::Result {
+        // Pad only when earlier fields were written, so a record of skipped fields adds nothing.
+        let is_empty = current.fields.is_empty();
+        let mut visitor =
+            ContentRedactingVisitor(DefaultVisitor::new(current.as_writer(), is_empty));
+        fields.record(&mut visitor);
+        visitor.0.finish()
+    }
+}
+
+/// Forwards every non-content field to the default visitor. Unlisted `record_*` methods fall
+/// back to `record_debug`, which applies the same check.
+struct ContentRedactingVisitor<'writer>(DefaultVisitor<'writer>);
+
+impl Visit for ContentRedactingVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if !is_content_field(field.name()) {
+            self.0.record_str(field, value);
+        }
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        if !is_content_field(field.name()) {
+            self.0.record_error(field, value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if !is_content_field(field.name()) {
+            self.0.record_debug(field, value);
+        }
+    }
 }
 
 fn log_filter() -> Result<EnvFilter, String> {
@@ -807,5 +912,157 @@ mod tests {
             record_root_route_context(span, Some("auto"), "random", Some("session-1"), None);
         });
         assert_absent(&span, LangfuseKeys::USER_ID);
+    }
+
+    /// Captures everything the log layer writes, standing in for stderr.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log buffer poisoned").clone())
+                .expect("log output is utf-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn log_layer_never_prints_content_but_otlp_span_keeps_it() {
+        use super::{format_layer, record_root_input, record_root_output};
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use switchyard_protocol::{
+            AggLlmResponse, ContentBlock, LlmRequest, LlmResponse, Message, Response,
+            ResponseOutput, Role,
+        };
+
+        const PROMPT: &str = "PROMPT-SECRET-4111111111111111";
+        const COMPLETION: &str = "COMPLETION-SECRET-123-45-6789";
+
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("content-redaction-test");
+        let subscriber = tracing_subscriber::registry()
+            .with(format_layer(move || writer.clone()))
+            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = request_span(&HeaderMap::new());
+            let request = LlmRequest {
+                messages: vec![Message::text(Role::User, PROMPT)],
+                ..LlmRequest::default()
+            };
+            let response = Response {
+                llm_response: LlmResponse::Agg(AggLlmResponse {
+                    model: Some("test-model".to_string()),
+                    outputs: vec![ResponseOutput {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: COMPLETION.into(),
+                        }],
+                        stop_reason: None,
+                    }],
+                    ..AggLlmResponse::default()
+                }),
+                metadata: None,
+            };
+            record_root_input(&span, &request);
+            super::record_root_route_context(&span, Some("rp-auto"), "random", None, None);
+            record_root_output(&span, &response);
+            let _entered = span.enter();
+            // Same shape as the request log line: an event inside the request span.
+            tracing::info!(status = 200, "request finished");
+            // A content field on the event itself is dropped too.
+            tracing::info!(gen_ai.prompt = PROMPT, "event with content field");
+        });
+
+        let output = log.contents();
+        assert!(
+            output.contains("request finished"),
+            "request log line missing: {output}"
+        );
+        assert!(
+            output.contains("switchyard.request{"),
+            "span context missing from log line: {output}"
+        );
+        assert!(
+            output.contains("switchyard.route.id=\"rp-auto\""),
+            "non-content span fields must still be logged: {output}"
+        );
+        assert!(
+            output.contains("status=200"),
+            "event fields missing: {output}"
+        );
+        for forbidden in [PROMPT, COMPLETION, "gen_ai.prompt", "gen_ai.completion"] {
+            assert!(
+                !output.contains(forbidden),
+                "log output must not contain {forbidden:?}: {output}"
+            );
+        }
+
+        let spans = exporter.get_finished_spans().expect("failed to get spans");
+        let root_span = spans
+            .iter()
+            .find(|s| s.name == "switchyard.request")
+            .expect("no switchyard.request span");
+        let attribute = |key: &str| {
+            root_span
+                .attributes
+                .iter()
+                .find(|a| a.key.as_str() == key)
+                .map(|a| a.value.as_str().into_owned())
+                .unwrap_or_else(|| panic!("{key} missing from OTLP span"))
+        };
+        assert!(attribute("gen_ai.prompt").contains(PROMPT));
+        assert!(attribute("gen_ai.completion").contains(COMPLETION));
+    }
+
+    #[test]
+    fn content_field_matching() {
+        use super::is_content_field;
+
+        for name in [
+            "gen_ai.prompt",
+            "gen_ai.completion",
+            "gen_ai.input.messages",
+            "gen_ai.output.messages",
+            "gen_ai.system_instructions",
+            "gen_ai.tool.call.arguments",
+            "gen_ai.tool.call.result",
+            "gen_ai.prompt.0.content",
+            "llm.input_messages.0.message.content",
+            "input.value",
+        ] {
+            assert!(
+                is_content_field(name),
+                "{name} should be treated as content"
+            );
+        }
+        for name in [
+            "message",
+            "gen_ai.output.type",
+            "gen_ai.request.model",
+            "switchyard.route.id",
+            "langfuse.user.id",
+            "error",
+        ] {
+            assert!(!is_content_field(name), "{name} should still be logged");
+        }
     }
 }
