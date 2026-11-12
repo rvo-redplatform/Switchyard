@@ -114,9 +114,7 @@ pub fn force_structured_output_tool(
 
 // Reads the tool parameters, description and strictness from a Chat-shaped
 // `{"type": "json_schema", "json_schema": {...}}` format.
-fn json_schema_tool_parts(
-    format: &Value,
-) -> Result<(Value, String, Option<bool>), LlmClientError> {
+fn json_schema_tool_parts(format: &Value) -> Result<(Value, String, Option<bool>), LlmClientError> {
     let spec = format.get("json_schema").and_then(Value::as_object);
     let parameters = match spec.and_then(|spec| spec.get("schema")) {
         None | Some(Value::Null) => permissive_object_schema(),
@@ -274,9 +272,7 @@ impl StreamUnwrap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use switchyard_protocol::{
-        FormatId, ResponseOutput, Role, ToolCall, WireFormat, text_request,
-    };
+    use switchyard_protocol::{FormatId, ResponseOutput, Role, ToolCall, WireFormat, text_request};
 
     fn schema() -> Value {
         json!({
@@ -293,10 +289,10 @@ mod tests {
             "type": "json_schema",
             "json_schema": {"name": "answer", "schema": schema(), "strict": true}
         }));
-        request
-            .preservation
-            .requests
-            .insert(FormatId::from(WireFormat::OpenAiChat), json!({"model": "route"}));
+        request.preservation.requests.insert(
+            FormatId::from(WireFormat::OpenAiChat),
+            json!({"model": "route"}),
+        );
         request
     }
 
@@ -493,7 +489,10 @@ mod tests {
         let mut out = Vec::new();
         for item in stream.collect::<Vec<_>>().await {
             let event = item.expect("no stream errors");
-            assert!(event.preservation().is_none(), "raw events are not replayed");
+            assert!(
+                event.preservation().is_none(),
+                "raw events are not replayed"
+            );
             out.extend(event.normalized().iter().cloned());
         }
         out

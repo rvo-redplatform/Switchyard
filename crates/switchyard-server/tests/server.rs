@@ -3618,7 +3618,10 @@ target = "plain"
     assert_eq!(buffered.status, StatusCode::OK, "{}", buffered.text()?);
     let buffered = buffered.json()?;
     let choice = &buffered["choices"][0];
-    assert_eq!(choice["message"]["content"], r#"{"answer":42}"#, "{buffered}");
+    assert_eq!(
+        choice["message"]["content"], r#"{"answer":42}"#,
+        "{buffered}"
+    );
     assert!(choice["message"]["tool_calls"].is_null(), "{buffered}");
     assert_eq!(choice["finish_reason"], "stop", "{buffered}");
     {
@@ -3711,7 +3714,10 @@ target = "plain"
     let refused = send(&app, "POST", "/v1/chat/completions", Some(ambiguous)).await?;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST);
     let refused = refused.json()?;
-    assert_eq!(refused["error"]["type"], "invalid_request_error", "{refused}");
+    assert_eq!(
+        refused["error"]["type"], "invalid_request_error",
+        "{refused}"
+    );
     assert!(
         refused["error"]["message"]
             .as_str()
