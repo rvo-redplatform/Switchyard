@@ -85,7 +85,7 @@ pub fn force_structured_output_tool(
     let (parameters, description, strict) = if format_type == "json_schema" {
         json_schema_tool_parts(format)?
     } else {
-        (permissive_object_schema(), None, None)
+        (permissive_object_schema(), TOOL_DESCRIPTION.to_string(), None)
     };
     if !request.tools.is_empty() {
         return Err(invalid_request(format!(
