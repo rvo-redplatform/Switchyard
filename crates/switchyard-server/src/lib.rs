@@ -1268,6 +1268,7 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
+            "reasoning": capabilities.reasoning,
             "context_window": capabilities.context_window,
             "supported_inbound_formats": [
                 "openai-chat-completions",
