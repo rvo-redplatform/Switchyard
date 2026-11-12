@@ -1073,9 +1073,11 @@ mod tests {
     #[test]
     fn rejected_lossy_conversion_is_an_invalid_request() {
         assert!(matches!(
-            super::request_encoding_error(switchyard_translation::TranslationError::LossyConversion(
-                "video input".to_string()
-            )),
+            super::request_encoding_error(
+                switchyard_translation::TranslationError::LossyConversion(
+                    "video input".to_string()
+                )
+            ),
             LlmClientError::InvalidRequest { .. }
         ));
         assert!(matches!(

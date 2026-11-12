@@ -16,9 +16,9 @@ use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
-    AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
-    Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
-    SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest, Message,
+    OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role, SamplingParams,
+    StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -984,7 +984,8 @@ impl<'a> AnthropicCacheMarks<'a> {
         } else {
             None
         };
-        let messages: Vec<Option<&'a Value>> = match body.get("messages").and_then(Value::as_array) {
+        let messages: Vec<Option<&'a Value>> = match body.get("messages").and_then(Value::as_array)
+        {
             Some(source) if source.len() == request.messages.len() => source
                 .iter()
                 .map(|message| message.get("content").and_then(last_cache_control))

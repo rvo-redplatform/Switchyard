@@ -203,13 +203,8 @@ impl Route {
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
         let algorithm = self.algorithm_for(&request)?;
-        let (selected_model, response) = switchyard_llm_client::run(
-            algorithm,
-            self.clients.clone(),
-            request,
-            observer,
-        )
-        .await?;
+        let (selected_model, response) =
+            switchyard_llm_client::run(algorithm, self.clients.clone(), request, observer).await?;
         Ok(RunOutput {
             selected_model,
             response,

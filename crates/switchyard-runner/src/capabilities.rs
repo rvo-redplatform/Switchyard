@@ -177,7 +177,8 @@ impl RequestFeatures {
 
     /// Whether `target` supports every needed capability.
     pub fn fit(&self, target: &TargetCapabilities) -> bool {
-        self.required().all(|capability| target.supports(capability))
+        self.required()
+            .all(|capability| target.supports(capability))
     }
 }
 
@@ -520,7 +521,10 @@ mod tests {
         let filter = filter(FilterStrategy::Random { seed: Some(7) });
         let image = RequestFeatures::from_capabilities([Capability::Image]);
         assert!(matches!(filter.select(&image), Ok(None)));
-        assert!(matches!(filter.select(&RequestFeatures::default()), Ok(None)));
+        assert!(matches!(
+            filter.select(&RequestFeatures::default()),
+            Ok(None)
+        ));
     }
 
     #[test]

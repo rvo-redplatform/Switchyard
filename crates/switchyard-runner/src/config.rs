@@ -230,7 +230,11 @@ impl DeploymentConfig {
     // Random, passthrough, and llm_classifier routes filter their serving
     // targets by request features. Other algorithms pick tiers by their own
     // signals and are left unfiltered, as are routes whose targets declare nothing.
-    fn build_target_filter(&self, route_id: &ModelId, spec: &AlgorithmSpec) -> Option<TargetFilter> {
+    fn build_target_filter(
+        &self,
+        route_id: &ModelId,
+        spec: &AlgorithmSpec,
+    ) -> Option<TargetFilter> {
         let (names, weights, strategy) = match spec {
             AlgorithmSpec::Random {
                 targets,
@@ -257,7 +261,10 @@ impl DeploymentConfig {
             .filter_map(|name| self.targets.get(name))
             .map(|target| (target.id.clone(), target.capabilities()))
             .collect::<Vec<_>>();
-        if !targets.iter().any(|(_, capabilities)| capabilities.is_declared()) {
+        if !targets
+            .iter()
+            .any(|(_, capabilities)| capabilities.is_declared())
+        {
             return None;
         }
         Some(TargetFilter::new(
@@ -1133,7 +1140,10 @@ classifier_magic = true
         };
         assert!(weak.capabilities().supports(Capability::Tools));
         assert!(!weak.capabilities().supports(Capability::Reasoning));
-        assert_eq!(weak.unknown_capabilities().collect::<Vec<_>>(), ["from_the_future"]);
+        assert_eq!(
+            weak.unknown_capabilities().collect::<Vec<_>>(),
+            ["from_the_future"]
+        );
         let Some(classifier) = config.targets.get("classifier") else {
             return Err(RunnerError::configuration("classifier target is missing"));
         };
@@ -1144,14 +1154,25 @@ classifier_magic = true
             runner
                 .models()
                 .find(|model| model.id.as_str() == id)
-                .map(|model| (model.capabilities.tool_calling, model.capabilities.reasoning))
+                .map(|model| {
+                    (
+                        model.capabilities.tool_calling,
+                        model.capabilities.reasoning,
+                    )
+                })
         };
         // random over strong + weak: the intersection has tools but not reasoning.
         assert_eq!(flags("switchyard/random"), Some((Some(true), Some(false))));
         // passthrough to weak only.
-        assert_eq!(flags("switchyard/passthrough"), Some((Some(true), Some(false))));
+        assert_eq!(
+            flags("switchyard/passthrough"),
+            Some((Some(true), Some(false)))
+        );
         // classifier serves strong + weak (the judge is not counted).
-        assert_eq!(flags("switchyard/classifier"), Some((Some(true), Some(false))));
+        assert_eq!(
+            flags("switchyard/classifier"),
+            Some((Some(true), Some(false)))
+        );
         // noop has no serving targets, so nothing is derived.
         assert_eq!(flags("switchyard/noop"), Some((None, None)));
         Ok(())

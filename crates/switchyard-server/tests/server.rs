@@ -3486,6 +3486,9 @@ target = "open"
             .is_some_and(|message| message.contains("audio")),
         "{audio_body}"
     );
-    assert!(upstream.calls.lock().await.is_empty(), "media must not reach the upstream");
+    assert!(
+        upstream.calls.lock().await.is_empty(),
+        "media must not reach the upstream"
+    );
     Ok(())
 }
