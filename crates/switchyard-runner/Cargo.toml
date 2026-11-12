@@ -14,6 +14,7 @@ rust-version.workspace = true
 publish = ["crates-io"]
 
 [dependencies]
+futures-util.workspace = true
 libsy = { package = "switchyard-libsy", path = "../libsy", version = "0.2.0" }
 reqwest.workspace = true
 serde.workspace = true
@@ -27,5 +28,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-futures-util.workspace = true
 tokio.workspace = true

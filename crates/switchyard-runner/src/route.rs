@@ -12,7 +12,7 @@ use switchyard_llm_client::{ClientRouter, RunObserver, TranslatingLlmClient};
 use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat};
 use thiserror::Error;
 
-use crate::{DecisionTarget, RequestFeatures, TargetFilter};
+use crate::{DecisionTarget, RequestFeatures, TargetFilter, force_structured_output_tool};
 
 /// Capabilities that one route advertises on `GET /v1/models`.
 ///
@@ -197,14 +197,23 @@ impl Route {
     }
 
     /// Executes the configured route without consuming or proxying streamed responses.
+    ///
+    /// A JSON `response_format` is served as one forced tool call: the request
+    /// is rewritten before target selection, so only tool-capable targets are
+    /// chosen, and the call is unwrapped back into message content.
     pub async fn execute(
         &self,
-        request: Request,
+        mut request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
+        let forced = force_structured_output_tool(&mut request.llm_request)?;
         let algorithm = self.algorithm_for(&request)?;
         let (selected_model, response) =
             switchyard_llm_client::run(algorithm, self.clients.clone(), request, observer).await?;
+        let response = match &forced {
+            Some(forced) => forced.unwrap_response(response),
+            None => response,
+        };
         Ok(RunOutput {
             selected_model,
             response,
@@ -212,7 +221,9 @@ impl Route {
     }
 
     /// Completes routing-time calls without serving the answer target.
-    pub async fn decide(&self, request: Request) -> Result<RoutingOutcome, RunnerError> {
+    pub async fn decide(&self, mut request: Request) -> Result<RoutingOutcome, RunnerError> {
+        // Rewrite as `execute` does, so the decision matches the target that would serve it.
+        force_structured_output_tool(&mut request.llm_request)?;
         let algorithm = self.algorithm_for(&request)?;
         drive(algorithm, request, |call| {
             serve_decision_dependency(self.clients.clone(), call)

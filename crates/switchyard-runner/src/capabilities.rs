@@ -93,11 +93,14 @@ impl TargetCapabilities {
 
     /// Whether the target may serve a request that needs `capability`.
     ///
-    /// Always true for an undeclared target.
+    /// Always true for an undeclared target. Structured output is also
+    /// supported wherever tools are, because it is served as a forced tool call.
     pub fn supports(&self, capability: Capability) -> bool {
-        self.declared
-            .as_ref()
-            .is_none_or(|declared| declared.contains(&capability))
+        self.declared.as_ref().is_none_or(|declared| {
+            declared.contains(&capability)
+                || (capability == Capability::StructuredOutput
+                    && declared.contains(&Capability::Tools))
+        })
     }
 
     /// The capabilities every target supports, or `None` when any target is
@@ -446,6 +449,16 @@ mod tests {
                 Capability::Tools
             ]))
         );
+    }
+
+    #[test]
+    fn tools_imply_structured_output() {
+        let tools = TargetCapabilities::declared([Capability::Text, Capability::Tools]);
+        assert!(tools.supports(Capability::StructuredOutput));
+        let text = TargetCapabilities::declared([Capability::Text]);
+        assert!(!text.supports(Capability::StructuredOutput));
+        let native = TargetCapabilities::declared([Capability::Text, Capability::StructuredOutput]);
+        assert!(native.supports(Capability::StructuredOutput));
     }
 
     fn image_request() -> LlmRequest {
