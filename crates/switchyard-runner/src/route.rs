@@ -12,7 +12,7 @@ use switchyard_llm_client::{ClientRouter, RunObserver, TranslatingLlmClient};
 use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat};
 use thiserror::Error;
 
-use crate::DecisionTarget;
+use crate::{DecisionTarget, RequestFeatures, TargetFilter};
 
 /// Capabilities that one route advertises on `GET /v1/models`.
 ///
@@ -114,6 +114,8 @@ pub struct Route {
     capabilities: ModelCapabilities,
     count_tokens_target: Option<CountTokensTarget>,
     decision_targets: Vec<DecisionTarget>,
+    // Narrows the serving targets to those that support each request.
+    target_filter: Option<TargetFilter>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -139,7 +141,26 @@ impl Route {
             capabilities,
             count_tokens_target,
             decision_targets,
+            target_filter: None,
         }
+    }
+
+    /// Routes each request only to targets whose declared capabilities cover
+    /// it, refusing it with an invalid-request error when none does.
+    pub fn with_target_filter(mut self, filter: TargetFilter) -> Self {
+        self.target_filter = Some(filter);
+        self
+    }
+
+    // Picks the configured algorithm, or a narrowed one when some targets
+    // cannot serve this request.
+    fn algorithm_for(&self, request: &Request) -> Result<Arc<dyn Algorithm>, RunnerError> {
+        let Some(filter) = &self.target_filter else {
+            return Ok(Arc::clone(&self.algorithm));
+        };
+        Ok(filter
+            .select(&RequestFeatures::of(&request.llm_request))?
+            .unwrap_or_else(|| Arc::clone(&self.algorithm)))
     }
 
     /// Returns the configured libsy algorithm name.
@@ -181,13 +202,9 @@ impl Route {
         request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
-        let (selected_model, response) = switchyard_llm_client::run(
-            Arc::clone(&self.algorithm),
-            self.clients.clone(),
-            request,
-            observer,
-        )
-        .await?;
+        let algorithm = self.algorithm_for(&request)?;
+        let (selected_model, response) =
+            switchyard_llm_client::run(algorithm, self.clients.clone(), request, observer).await?;
         Ok(RunOutput {
             selected_model,
             response,
@@ -196,7 +213,8 @@ impl Route {
 
     /// Completes routing-time calls without serving the answer target.
     pub async fn decide(&self, request: Request) -> Result<RoutingOutcome, RunnerError> {
-        drive(Arc::clone(&self.algorithm), request, |call| {
+        let algorithm = self.algorithm_for(&request)?;
+        drive(algorithm, request, |call| {
             serve_decision_dependency(self.clients.clone(), call)
         })
         .await

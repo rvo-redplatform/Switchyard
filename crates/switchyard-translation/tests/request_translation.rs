@@ -170,7 +170,8 @@ fn anthropic_request_translates_to_openai_chat_without_anthropic_only_fields() -
         json!({"type": "function", "function": {"name": "lookup"}})
     );
     assert_eq!(output["max_completion_tokens"], 100);
-    assert!(output.get("thinking").is_none());
+    // Thinking reaches the gateway as its Chat `thinking` extension.
+    assert_eq!(output["thinking"], json!({"type": "adaptive"}));
     assert!(output.get("container").is_none());
     Ok(())
 }
@@ -673,7 +674,10 @@ fn anthropic_openai_compatible_extensions_are_preserved_for_openai_chat() -> Tes
 
     assert_eq!(output["metadata"], json!({"user_id": "u123"}));
     assert_eq!(output["stop"], json!(["END"]));
-    assert!(output.get("thinking").is_none());
+    assert_eq!(
+        output["thinking"],
+        json!({"type": "enabled", "budget_tokens": 5000})
+    );
     Ok(())
 }
 
@@ -2288,5 +2292,163 @@ fn anthropic_thinking_is_dropped_from_responses_input() -> TestResult {
             .iter()
             .any(|item| item["type"] == "function_call_output")
     );
+    Ok(())
+}
+
+// Anthropic prompt-cache markers survive translation to OpenAI Chat on the
+// matching system message, conversation message, and tool.
+#[test]
+fn anthropic_cache_control_is_carried_to_openai_chat() -> TestResult {
+    let engine = TranslationEngine::default();
+    let marker = json!({"type": "ephemeral"});
+    let body = json!({
+        "model": "claude-haiku",
+        "max_tokens": 100,
+        "system": [{"type": "text", "text": "Long shared prompt.", "cache_control": marker}],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "First question.", "cache_control": marker}
+            ]},
+            {"role": "assistant", "content": "First answer."},
+            {"role": "user", "content": "Second question."}
+        ],
+        "tools": [
+            {"name": "plain", "input_schema": {"type": "object"}},
+            {"name": "cached", "input_schema": {"type": "object"}, "cache_control": marker}
+        ],
+        "thinking": {"type": "disabled"}
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(
+        output["messages"][0]["content"],
+        json!([{"type": "text", "text": "Long shared prompt.", "cache_control": marker}])
+    );
+    assert_eq!(
+        output["messages"][1]["content"],
+        json!([{"type": "text", "text": "First question.", "cache_control": marker}])
+    );
+    assert_eq!(output["messages"][2]["content"], "First answer.");
+    assert_eq!(output["messages"][3]["content"], "Second question.");
+    assert!(output["tools"][0].get("cache_control").is_none());
+    assert_eq!(output["tools"][1]["cache_control"], marker);
+    assert_eq!(output["thinking"], json!({"type": "disabled"}));
+    Ok(())
+}
+
+// A Responses `reasoning` object is not an Anthropic thinking setting.
+#[test]
+fn responses_reasoning_is_not_sent_as_thinking() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-5",
+        "input": "hi",
+        "reasoning": {"effort": "high"}
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(output["reasoning_effort"], "high");
+    assert!(output.get("thinking").is_none());
+    Ok(())
+}
+
+// Audio and video cannot reach a Chat upstream, so translation refuses them
+// instead of replacing the media with a text description of it.
+#[test]
+fn media_is_refused_rather_than_turned_into_text_for_openai_chat() {
+    let engine = TranslationEngine::default();
+    let cases = [
+        (
+            WireFormat::OpenAiResponses,
+            json!({
+                "model": "gpt-4o",
+                "input": [{"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "transcribe"},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]}]
+            }),
+            "audio",
+        ),
+        (
+            WireFormat::AnthropicMessages,
+            json!({
+                "model": "claude-haiku",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "video", "source": {"type": "url", "url": "https://example.test/a.mp4"}}
+                ]}]
+            }),
+            "video",
+        ),
+    ];
+
+    for (source, body, kind) in cases {
+        match engine.translate_request(
+            source,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        ) {
+            Err(switchyard_translation::TranslationError::LossyConversion(message)) => {
+                assert!(message.contains(kind), "{source:?}: {message}");
+            }
+            Err(error) => panic!("{source:?}: expected a lossy-conversion refusal, got {error}"),
+            Ok(output) => panic!("{source:?}: media was translated: {}", output.body),
+        }
+    }
+}
+
+// Signed thinking blocks are bound to the model that wrote them, and a routed
+// conversation may now be served by another target, so they are never replayed
+// to a Chat upstream. Unsigned reasoning text is not bound and still travels.
+#[test]
+fn signed_anthropic_thinking_is_not_replayed_to_openai_chat() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "claude-haiku",
+        "max_tokens": 100,
+        "thinking": {"type": "adaptive"},
+        "messages": [
+            {"role": "user", "content": "First question."},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "bound to haiku", "signature": "sig-haiku"},
+                {"type": "text", "text": "First answer."}
+            ]},
+            {"role": "user", "content": "Second question."}
+        ]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    let assistant = &output["messages"][1];
+    assert_eq!(assistant["role"], "assistant");
+    assert_eq!(assistant["content"], "First answer.");
+    assert!(assistant.get("reasoning").is_none(), "{assistant}");
+    assert!(assistant.get("reasoning_details").is_none(), "{assistant}");
+    assert!(!output.to_string().contains("sig-haiku"));
     Ok(())
 }
