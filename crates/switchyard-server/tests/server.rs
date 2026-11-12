@@ -3368,3 +3368,124 @@ async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
     assert_eq!(completed["response"]["output"][0]["namespace"], "mcp__b");
     Ok(())
 }
+
+// Declared target capabilities drive /v1/models, refuse requests no target can
+// serve, and media a Chat upstream cannot carry is a 400 rather than text.
+#[tokio::test]
+async fn target_capabilities_filter_requests_and_media_is_refused() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.gateway]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+
+[targets.nova]
+id = "model/nova"
+llm_client = "gateway"
+capabilities = ["text", "image", "tools", "caching", "streaming"]
+
+[targets.haiku]
+id = "model/haiku"
+llm_client = "gateway"
+capabilities = ["text", "image", "tools", "reasoning", "caching", "streaming"]
+
+[routes.fast]
+id = "rp-fast"
+type = "random"
+targets = ["nova", "haiku"]
+
+[targets.open]
+id = "model/open"
+llm_client = "gateway"
+
+[routes.cheap]
+id = "rp-cheap"
+type = "passthrough"
+target = "nova"
+
+[routes.open]
+id = "rp-open"
+type = "passthrough"
+target = "open"
+"#,
+        base_url = upstream.base_url
+    ))?;
+    let app = build_switchyard_router(state);
+
+    let models = send(&app, "GET", "/v1/models", None).await?.json()?;
+    let data = models["data"].as_array().cloned().unwrap_or_default();
+    let fast = data
+        .iter()
+        .find(|entry| entry["id"] == "rp-fast")
+        .ok_or("rp-fast is listed")?;
+    assert_eq!(fast["capabilities"]["tool_calling"], json!(true));
+    assert_eq!(fast["capabilities"]["reasoning"], json!(false));
+
+    let thinking = send(
+        &app,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "rp-cheap",
+            "max_tokens": 64,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "think"}]
+        })),
+    )
+    .await?;
+    assert_eq!(thinking.status, StatusCode::BAD_REQUEST);
+    assert_eq!(thinking.json()?["error"]["type"], "invalid_request_error");
+
+    let video = send(
+        &app,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "rp-fast",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "video", "source": {"type": "url", "url": "https://example.test/a.mp4"}}
+            ]}]
+        })),
+    )
+    .await?;
+    assert_eq!(video.status, StatusCode::BAD_REQUEST);
+    let video_body = video.json()?;
+    assert_eq!(video_body["error"]["type"], "invalid_request_error");
+    assert!(
+        video_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("video")),
+        "{video_body}"
+    );
+
+    // An undeclared target filters nothing, so the translator itself refuses the media.
+    let audio = send(
+        &app,
+        "POST",
+        "/v1/responses",
+        Some(json!({
+            "model": "rp-open",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "transcribe"},
+                {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+            ]}]
+        })),
+    )
+    .await?;
+    assert_eq!(audio.status, StatusCode::BAD_REQUEST);
+    let audio_body = audio.json()?;
+    assert!(
+        audio_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("audio")),
+        "{audio_body}"
+    );
+    assert!(upstream.calls.lock().await.is_empty(), "media must not reach the upstream");
+    Ok(())
+}

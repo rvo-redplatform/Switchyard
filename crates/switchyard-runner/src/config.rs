@@ -18,8 +18,8 @@ use switchyard_llm_client::{
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
 use crate::{
-    AlgorithmSpec, CallerAuthKind, Capability, CountTokensTarget, DecisionTarget,
-    ModelCapabilities, Route, Runner, RunnerError, TargetCapabilities,
+    AlgorithmSpec, CallerAuthKind, Capability, CountTokensTarget, DecisionTarget, FilterStrategy,
+    ModelCapabilities, Route, Runner, RunnerError, TargetCapabilities, TargetFilter,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -211,7 +211,7 @@ impl DeploymentConfig {
                 .into_iter()
                 .filter_map(|name| self.decision_target(name))
                 .collect();
-            let route = Route::new(
+            let mut route = Route::new(
                 algorithm,
                 route_clients,
                 caller_auth,
@@ -219,9 +219,53 @@ impl DeploymentConfig {
                 count_tokens_target,
                 decision_targets,
             );
+            if let Some(filter) = self.build_target_filter(&config.id, &config.algorithm) {
+                route = route.with_target_filter(filter);
+            }
             routes.push((config.id.clone(), route));
         }
         Ok(Runner::new(routes))
+    }
+
+    // Random, passthrough, and llm_classifier routes filter their serving
+    // targets by request features. Other algorithms pick tiers by their own
+    // signals and are left unfiltered, as are routes whose targets declare nothing.
+    fn build_target_filter(&self, route_id: &ModelId, spec: &AlgorithmSpec) -> Option<TargetFilter> {
+        let (names, weights, strategy) = match spec {
+            AlgorithmSpec::Random {
+                targets,
+                weights,
+                seed,
+            } => (
+                targets.iter().map(String::as_str).collect::<Vec<_>>(),
+                weights.clone(),
+                FilterStrategy::Random { seed: *seed },
+            ),
+            AlgorithmSpec::Passthrough {
+                target,
+                subagents: None,
+            } => (vec![target.as_str()], None, FilterStrategy::FirstEligible),
+            AlgorithmSpec::LlmClassifier { .. } => (
+                spec.routing_target_names(),
+                None,
+                FilterStrategy::FirstEligible,
+            ),
+            _ => return None,
+        };
+        let targets = names
+            .into_iter()
+            .filter_map(|name| self.targets.get(name))
+            .map(|target| (target.id.clone(), target.capabilities()))
+            .collect::<Vec<_>>();
+        if !targets.iter().any(|(_, capabilities)| capabilities.is_declared()) {
+            return None;
+        }
+        Some(TargetFilter::new(
+            route_id.as_str(),
+            targets,
+            weights,
+            strategy,
+        ))
     }
 
     fn build_clients(&self) -> RunnerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {

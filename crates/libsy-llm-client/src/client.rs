@@ -19,7 +19,7 @@ use switchyard_protocol::{
     Response, RoutedLlmClient,
 };
 use switchyard_translation::{
-    WireFormat, decode_aggregated_response, decode_request, decode_stream,
+    TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
     encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
 };
 use tracing::Instrument;
@@ -211,8 +211,7 @@ impl TranslatingLlmClient {
         model: &ModelId,
         endpoint: UpstreamEndpoint,
     ) -> Result<EncodedResponse> {
-        let mut body = encode_request(&llm_request, wire_format)
-            .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
+        let mut body = encode_request(&llm_request, wire_format).map_err(request_encoding_error)?;
         // `encode_request` round-trips a preserved same-format body verbatim,
         // which keeps the caller's original `model`; force the resolved model so
         // the upstream always sees the target id.
@@ -746,6 +745,17 @@ fn strip_anthropic_incompatible_fields(body: &mut Value) {
 // unsigned, so the Anthropic leg must drop them or the upstream rejects the
 // request. Bedrock enforces this (surfacing as a SigV4 signature mismatch) where
 // Azure-hosted Anthropic currently does not.
+// A rejected lossy conversion is the caller's content the upstream format cannot
+// carry, so it is an invalid request (400), not a server-side encoding failure.
+fn request_encoding_error(error: TranslationError) -> LlmClientError {
+    match error {
+        TranslationError::LossyConversion(_) => LlmClientError::InvalidRequest {
+            message: error.to_string(),
+        },
+        other => LlmClientError::RequestEncoding(other.to_string()),
+    }
+}
+
 fn strip_unsigned_thinking_blocks(body: &mut Value) {
     let Value::Object(object) = body else {
         return;
@@ -1057,6 +1067,23 @@ mod tests {
                 {"role": "user", "content": [{"type": "text", "text": "new"}]}
             ]
         })
+    }
+
+    // Media a Chat upstream cannot carry is the caller's error, not ours.
+    #[test]
+    fn rejected_lossy_conversion_is_an_invalid_request() {
+        assert!(matches!(
+            super::request_encoding_error(switchyard_translation::TranslationError::LossyConversion(
+                "video input".to_string()
+            )),
+            LlmClientError::InvalidRequest { .. }
+        ));
+        assert!(matches!(
+            super::request_encoding_error(switchyard_translation::TranslationError::Other(
+                "boom".to_string()
+            )),
+            LlmClientError::RequestEncoding(_)
+        ));
     }
 
     #[test]
