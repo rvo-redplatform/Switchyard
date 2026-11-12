@@ -18,8 +18,8 @@ use switchyard_llm_client::{
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
 use crate::{
-    AlgorithmSpec, CallerAuthKind, CountTokensTarget, DecisionTarget, ModelCapabilities, Route,
-    Runner, RunnerError,
+    AlgorithmSpec, CallerAuthKind, Capability, CountTokensTarget, DecisionTarget,
+    ModelCapabilities, Route, Runner, RunnerError, TargetCapabilities,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -161,6 +161,11 @@ impl DeploymentConfig {
                     target.llm_client
                 );
             }
+            for value in target.unknown_capabilities() {
+                tracing::warn!(
+                    "target {target_name} declares unknown capability {value:?}; it is ignored"
+                );
+            }
         }
 
         let clients = self.build_clients()?;
@@ -176,7 +181,19 @@ impl DeploymentConfig {
                     ))
                 })?;
             }
-            let capabilities = config.capabilities();
+            let mut capabilities = config.capabilities();
+            // Declared target capabilities replace the hand-set flags: the route
+            // advertises what every serving target supports.
+            let serving = config
+                .routing_target_names()
+                .into_iter()
+                .filter_map(|name| self.targets.get(name))
+                .map(TargetConfig::capabilities)
+                .collect::<Vec<_>>();
+            if let Some(shared) = TargetCapabilities::intersection(&serving) {
+                capabilities.tool_calling = Some(shared.contains(&Capability::Tools));
+                capabilities.reasoning = Some(shared.contains(&Capability::Reasoning));
+            }
             if capabilities.context_window == Some(0) {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} context_window must be greater than zero"
@@ -379,6 +396,29 @@ struct TargetConfig {
     llm_client: String,
     #[serde(default)]
     extra_body: BTreeMap<String, Value>,
+    /// What the target supports end to end. Absent means undeclared.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+}
+
+impl TargetConfig {
+    // Unknown names are ignored so newer config writers stay loadable.
+    fn capabilities(&self) -> TargetCapabilities {
+        match &self.capabilities {
+            None => TargetCapabilities::undeclared(),
+            Some(values) => TargetCapabilities::declared(
+                values.iter().filter_map(|value| Capability::parse(value)),
+            ),
+        }
+    }
+
+    fn unknown_capabilities(&self) -> impl Iterator<Item = &str> {
+        self.capabilities
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|value| Capability::parse(value).is_none())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1023,6 +1063,77 @@ classifier_magic = true
                 "expected error containing {expected}, got {error}"
             );
         }
+    }
+
+    // Serving targets' declared capabilities replace the route's hand-set flags.
+    #[test]
+    fn target_capabilities_parse_and_derive_route_flags() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replace(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\ncapabilities = ['text', 'image', 'tools', 'reasoning', 'caching', 'streaming']",
+            )
+            .replace(
+                "id = \"weak/model\"",
+                "id = \"weak/model\"\ncapabilities = ['text', 'image', 'tools', 'streaming', 'from_the_future']",
+            )
+            .replace(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\ntool_calling = false\nreasoning = true",
+            );
+        let config: DeploymentConfig = toml::from_str(&configured).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse config: {error}"))
+        })?;
+        let Some(weak) = config.targets.get("weak") else {
+            return Err(RunnerError::configuration("weak target is missing"));
+        };
+        assert!(weak.capabilities().supports(Capability::Tools));
+        assert!(!weak.capabilities().supports(Capability::Reasoning));
+        assert_eq!(weak.unknown_capabilities().collect::<Vec<_>>(), ["from_the_future"]);
+        let Some(classifier) = config.targets.get("classifier") else {
+            return Err(RunnerError::configuration("classifier target is missing"));
+        };
+        assert!(!classifier.capabilities().is_declared());
+
+        let runner = config.build()?;
+        let flags = |id: &str| {
+            runner
+                .models()
+                .find(|model| model.id.as_str() == id)
+                .map(|model| (model.capabilities.tool_calling, model.capabilities.reasoning))
+        };
+        // random over strong + weak: the intersection has tools but not reasoning.
+        assert_eq!(flags("switchyard/random"), Some((Some(true), Some(false))));
+        // passthrough to weak only.
+        assert_eq!(flags("switchyard/passthrough"), Some((Some(true), Some(false))));
+        // classifier serves strong + weak (the judge is not counted).
+        assert_eq!(flags("switchyard/classifier"), Some((Some(true), Some(false))));
+        // noop has no serving targets, so nothing is derived.
+        assert_eq!(flags("switchyard/noop"), Some((None, None)));
+        Ok(())
+    }
+
+    #[test]
+    fn undeclared_target_keeps_hand_set_route_flags() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replace(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\ncapabilities = ['text']",
+            )
+            .replace(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\ntool_calling = true",
+            );
+        let runner = runner_from_toml(&configured)?;
+        let Some(random) = runner
+            .models()
+            .find(|model| model.id.as_str() == "switchyard/random")
+        else {
+            return Err(RunnerError::configuration("random route is missing"));
+        };
+        assert_eq!(random.capabilities.tool_calling, Some(true));
+        assert_eq!(random.capabilities.reasoning, None);
+        Ok(())
     }
 
     #[test]
