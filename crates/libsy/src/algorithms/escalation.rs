@@ -17,7 +17,9 @@ use super::util::llm_judge::JudgeClassifier;
 use crate::core::algorithm::Driver;
 use crate::core::classifier::{Classification, Classifier};
 use crate::core::state::{State, StateValue};
+use crate::observability::record_routing;
 use crate::{LibsyError, Result};
+use switchyard_protocol::RoutingDecisionKeys as Keys;
 
 /// Session-state key holding the consecutive-escalate streak.
 const STREAK_KEY: &str = "escalation_streak";
@@ -37,6 +39,13 @@ fn assistant_message(response: &AggLlmResponse) -> Message {
             .map(|output| output.content.clone())
             .unwrap_or_default(),
     }
+}
+
+/// Routes to `capable` without a verdict, recording why.
+fn fall_back(capable: &ModelId, reason: &'static str) -> (Classification, Option<Response>) {
+    record_routing(Keys::DECIDED_BY, "fallback");
+    record_routing(Keys::FALLBACK_REASON, reason);
+    (decisive(capable), None)
 }
 
 /// Calls the efficient model, judges its response, and latches to capable once the streak
@@ -102,8 +111,14 @@ impl Classifier<State> for EscalationClassifier {
             });
         };
 
+        record_routing(
+            Keys::ESCALATION_CONFIRMATIONS,
+            i64::from(self.confirmations),
+        );
         // A confirmed session stays capable without a judge call.
         if streak(state) >= self.confirmations {
+            record_routing(Keys::ESCALATION_LATCHED, true);
+            record_routing(Keys::DECIDED_BY, "latch");
             return Ok((decisive(&self.capable), None));
         }
 
@@ -123,7 +138,7 @@ impl Classifier<State> for EscalationClassifier {
             Err(LibsyError::ClientCall {
                 source: LlmClientError::ContextWindowExceeded { .. },
                 ..
-            }) => return Ok((decisive(&self.capable), None)),
+            }) => return Ok(fall_back(&self.capable, "context_window")),
             Err(e) => return Err(e),
         };
         // The call resolves when its stream handle arrives; transport can still fail while
@@ -131,7 +146,7 @@ impl Classifier<State> for EscalationClassifier {
         let agg = match efficient_response.llm_response.into_agg().await {
             Ok(agg) => agg,
             Err(LlmClientError::Transport { .. }) => {
-                return Ok((decisive(&self.capable), None));
+                return Ok(fall_back(&self.capable, "transport"));
             }
             Err(source) => {
                 return Err(LibsyError::client_call(self.efficient.clone(), source));
@@ -167,9 +182,15 @@ impl Classifier<State> for EscalationClassifier {
         state
             .extra
             .insert(STREAK_KEY.to_string(), StateValue::Count(pending));
+        record_routing(Keys::ESCALATION_STREAK, i64::from(pending));
+        // No verdict: the efficient answer is served without the judge's backing.
+        if best.is_none() {
+            record_routing(Keys::DECIDED_BY, "fallback");
+        }
 
         if escalate && pending >= self.confirmations {
             // Streak confirmed: drop the efficient response, caller will serve capable.
+            record_routing(Keys::ESCALATION_LATCHED, true);
             return Ok((decisive(&self.capable), None));
         }
 

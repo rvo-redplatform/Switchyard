@@ -29,8 +29,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::core::algorithm::{self, Algorithm, Driver};
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::processor::{Event, Processor};
+use crate::observability::record_routing;
 use crate::{LibsyError, Result, RoutingOutcome};
-use switchyard_protocol::{ModelId, Request, Response};
+use switchyard_protocol::{ModelId, Request, Response, RoutingDecisionKeys};
 
 struct SessionState<S> {
     state: Arc<AsyncMutex<S>>,
@@ -76,6 +77,7 @@ impl<S: Send> Classifier<S> for DefaultTarget {
         _driver: Option<&Driver>,
     ) -> Result<(Classification, Option<Response>)> {
         // Zero confidence: this is a fallback, not a judgement.
+        record_routing(RoutingDecisionKeys::DECIDED_BY, "fallback");
         Ok((
             Classification::Scores(vec![Score {
                 target: self.target.clone(),
@@ -277,6 +279,9 @@ where
                 .find_map(|c| c.routing_tier(&target))
         });
         tracing::info!(algorithm=self.name, target=%score.target, confidence=score.confidence, tier = ?tier, "Model selected");
+        if let Some(tier) = tier {
+            record_routing(RoutingDecisionKeys::TIER, tier);
+        }
 
         // 4. Post-decision replay: every processor sees the selection so stateful ones
         //    can bind it, and may rewrite the outbound request (e.g. add a target prompt).

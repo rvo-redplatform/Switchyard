@@ -27,8 +27,9 @@ use super::util::target_selector::TargetSelectorPolicy;
 use crate::core::algorithm::{self, Algorithm, Driver};
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::state::State;
+use crate::observability::record_routing;
 use crate::{LibsyError, Result};
-use switchyard_protocol::{Request, Response};
+use switchyard_protocol::{Request, Response, RoutingDecisionKeys as Keys};
 
 const PROMPT_TEMPLATE: &str = include_str!("../prompts/capability-classifier/prompt.md");
 const SCHEMA_TEMPLATE: &str = include_str!("../prompts/capability-classifier/schema.json");
@@ -221,14 +222,30 @@ impl JudgePolicy for TaskClassifierPolicy {
     fn to_classification(&self, verdict: Option<&Self::Verdict>) -> Classification {
         // Judge output is untrusted. An absent, invalid, or inconsistent verdict is
         // ambiguous so the surrounding router applies its configured fallback.
-        let Some(verdict) = verdict.filter(|verdict| verdict.is_valid()) else {
+        let Some(verdict) = verdict else {
             return Classification::Ambiguous(vec![]);
         };
+        // Rule and boundary are judge-written: only a valid verdict proves them to be one
+        // of the enumerated labels, so an invalid one records its status alone.
+        let threshold = verdict
+            .is_valid()
+            .then(|| self.threshold(verdict))
+            .flatten();
+        let Some(threshold) = threshold else {
+            record_routing(Keys::JUDGE_VERDICT_STATUS, "invalid");
+            record_routing(Keys::FALLBACK_REASON, "verdict_invalid");
+            return Classification::Ambiguous(vec![]);
+        };
+        record_routing(Keys::JUDGE_P_SOLVE, verdict.p_solve);
+        record_routing(Keys::JUDGE_THRESHOLD, threshold);
+        record_routing(
+            Keys::JUDGE_CAPABILITY_BOUNDARY,
+            verdict.capability_boundary.clone(),
+        );
+        record_routing(Keys::JUDGE_PRIMARY_RULE, verdict.primary_rule.clone());
+        record_routing(Keys::JUDGE_CRUX, verdict.crux.clone());
         // A usable verdict below the capability threshold is still a decision: the judge
         // does not trust the efficient tier with this task.
-        let Some(threshold) = self.threshold(verdict) else {
-            return Classification::Ambiguous(vec![]);
-        };
         let target = if verdict.p_solve >= threshold
             || (threshold - verdict.p_solve).abs() <= f64::EPSILON
         {
@@ -489,9 +506,12 @@ pub struct LlmTaskClassifier {
     route: FallThrough<State>,
     /// Classifier used when this router is embedded in another cascade.
     inner: Arc<dyn Classifier<State>>,
+    /// Telemetry label for the configured mode.
+    mode: &'static str,
 }
 
 struct ClassifierRouteConfig {
+    mode: &'static str,
     default_target: ModelId,
     classify_trigger: ClassifyTrigger,
     message_hash_fallback: bool,
@@ -615,6 +635,7 @@ impl LlmTaskClassifier {
             targets,
             inner,
             ClassifierRouteConfig {
+                mode: "capability",
                 default_target: classifier.capable_target.clone(),
                 classify_trigger,
                 message_hash_fallback,
@@ -701,6 +722,7 @@ impl LlmTaskClassifier {
             resolved_targets,
             classifier,
             ClassifierRouteConfig {
+                mode: "custom",
                 default_target: default_name,
                 classify_trigger,
                 message_hash_fallback,
@@ -730,6 +752,7 @@ impl LlmTaskClassifier {
                 .with_name(ALGORITHM_NAME)
                 .with_classifier(Arc::clone(&inner)),
             inner,
+            mode: "escalation",
         })
     }
 
@@ -767,6 +790,7 @@ impl LlmTaskClassifier {
                 .with_classifier(inner.clone())
                 .with_classifier(Arc::new(fallback)),
             inner,
+            mode: config.mode,
         })
     }
 }
@@ -807,6 +831,7 @@ impl Classifier<State> for LlmTaskClassifier {
         request: &mut Request,
         driver: Option<&Driver>,
     ) -> Result<(Classification, Option<Response>)> {
+        record_routing(Keys::MODE, self.mode);
         self.inner.score(state, request, driver).await
     }
 }
@@ -822,6 +847,7 @@ impl Algorithm for LlmTaskClassifier {
         driver: Driver,
         request: Request,
     ) -> Result<crate::RoutingOutcome> {
+        record_routing(Keys::MODE, self.mode);
         self.route.execute(driver, request).await
     }
 }

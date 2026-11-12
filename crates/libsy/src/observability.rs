@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 use opentelemetry::metrics::Meter;
 use opentelemetry::{KeyValue, global};
 use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::Result;
 use switchyard_protocol::{CallRole, GenericKeys, LangfuseKeys, ModelId, Request, Response};
@@ -178,6 +179,18 @@ fn record_route_context(span: &Span, algorithm: &str, request: &Request) {
     if let Some(session) = session {
         span.record(LangfuseKeys::SESSION_ID, session);
     }
+}
+
+/// Records one [`RoutingDecisionKeys`](switchyard_protocol::RoutingDecisionKeys) attribute
+/// on the current `libsy.run` span.
+///
+/// Algorithms call it while routing, outside any `libsy.llm_call` await, so the current
+/// span is the run span. It writes the OpenTelemetry attribute directly rather than a
+/// `tracing` field: the run span is near the field limit, and the stderr log layer never
+/// prints these values. Values are bounded labels, numbers, or booleans, except for the
+/// `RoutingDecisionKeys::CONTENT` keys.
+pub(crate) fn record_routing(key: &'static str, value: impl Into<opentelemetry::Value>) {
+    Span::current().set_attribute(key, value);
 }
 
 /// Writes the same value to a generic key and its Langfuse observation metadata key.
@@ -338,7 +351,10 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
     use parking_lot::Mutex;
+    use switchyard_protocol::{LlmClientError, RoutingDecisionKeys as Keys};
     use tracing::Subscriber;
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
@@ -358,10 +374,19 @@ mod tests {
     // mix their results.
     static CAPTURE_STORE: std::sync::LazyLock<CaptureStore> =
         std::sync::LazyLock::new(CaptureStore::default);
+    // Routing-decision attributes are written straight to OpenTelemetry, so the shared
+    // subscriber also exports spans to memory for the tests that assert on them.
+    static OTEL_SPANS: std::sync::LazyLock<InMemorySpanExporter> =
+        std::sync::LazyLock::new(InMemorySpanExporter::default);
     static _SUBSCRIBER: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
-        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
-            store: CAPTURE_STORE.clone(),
-        });
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(OTEL_SPANS.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(CaptureLayer {
+                store: CAPTURE_STORE.clone(),
+            })
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("libsy-test")));
         // set_global_default is process-global and cannot be undone, so it
         // must be called exactly once.
         tracing::subscriber::set_global_default(subscriber)
@@ -745,6 +770,308 @@ mod tests {
 
         let call = find_span(&spans, "libsy.llm_call", ALGO);
         assert_eq!(call.fields.get(LangfuseKeys::SESSION_ID), None);
+        Ok(())
+    }
+
+    const CRUX: &str = "SECRET_CRUX_FROM_JUDGE";
+
+    /// Answers the `judge` target with `verdict`, or fails it when `verdict` is `None`, and
+    /// echoes every other target.
+    fn judge_replies(verdict: Option<&'static str>) -> impl Serve {
+        move |target: ModelId, _request: Request| async move {
+            if target != "judge" {
+                return Ok(reply(target));
+            }
+            match verdict {
+                Some(verdict) => Ok(reply(verdict)),
+                None => Err(LlmClientError::Timeout {
+                    source: Box::new(std::io::Error::other("judge unreachable")),
+                }),
+            }
+        }
+    }
+
+    /// Routes one request on `route` and returns its exported `libsy.run` attributes, plus
+    /// every `tracing` field recorded on any span of the run (what a log layer could print).
+    async fn routed_run(
+        algorithm: Arc<dyn Algorithm>,
+        route: &str,
+        serve: impl Serve,
+    ) -> Result<(BTreeMap<String, opentelemetry::Value>, Vec<SpanRecord>)> {
+        let _ = &*_SUBSCRIBER;
+        let request = Request {
+            llm_request: text_request(Some(route.to_string()), PROMPT),
+            raw_request: None,
+            metadata: None,
+        };
+        test_drive(algorithm, request, serve).await?;
+        let is_run = |span: &SpanData| {
+            span.name == "libsy.run"
+                && span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == GenericKeys::ROUTE_ID && kv.value.as_str() == route
+                })
+        };
+        // The run span closes when the spawned run task ends, just after the outcome is sent.
+        for _ in 0..200 {
+            let spans = OTEL_SPANS.get_finished_spans().unwrap_or_default();
+            if let Some(run) = spans.iter().find(|span| is_run(span)) {
+                let attributes = run
+                    .attributes
+                    .iter()
+                    .map(|kv| (kv.key.to_string(), kv.value.clone()))
+                    .collect();
+                let fields = CAPTURE_STORE
+                    .spans()
+                    .into_iter()
+                    .filter(|span| {
+                        span.fields.get("switchyard.route").map(String::as_str) == Some(route)
+                            || span.fields.get(GenericKeys::ROUTE_ID).map(String::as_str)
+                                == Some(route)
+                    })
+                    .collect();
+                return Ok((attributes, fields));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("libsy.run span for {route} was never exported");
+    }
+
+    fn text(attributes: &BTreeMap<String, opentelemetry::Value>, key: &str) -> Option<String> {
+        attributes.get(key).map(|value| value.as_str().into_owned())
+    }
+
+    /// Fails when `secret` appears in any routing attribute outside the content keys, or in
+    /// any `tracing` field a log layer could print.
+    fn assert_only_in_content(
+        attributes: &BTreeMap<String, opentelemetry::Value>,
+        fields: &[SpanRecord],
+        secret: &str,
+    ) {
+        for (key, value) in attributes {
+            if !Keys::CONTENT.contains(&key.as_str()) {
+                assert!(!value.as_str().contains(secret), "{key} carries free text");
+            }
+        }
+        for span in fields {
+            for (name, value) in &span.fields {
+                assert!(
+                    !value.contains(secret),
+                    "{name} on {} carries free text",
+                    span.name
+                );
+            }
+        }
+    }
+
+    fn capability_router() -> Result<Arc<dyn Algorithm>> {
+        use crate::algorithms::llm_class::{
+            LlmClassifierConfig, LlmTaskClassifier, TaskClassifierConfig,
+        };
+        Ok(Arc::new(LlmTaskClassifier::new(
+            LlmClassifierConfig::Capability {
+                judge_target: "judge".into(),
+                efficient_target: "efficient".into(),
+                capable_target: "capable".into(),
+                config: TaskClassifierConfig {
+                    base_threshold: 0.6,
+                    threshold_step: 0.1,
+                    ..TaskClassifierConfig::default()
+                },
+            },
+        )?))
+    }
+
+    /// A valid capability verdict explains the pick: p_solve below the boundary-adjusted
+    /// threshold sends the turn to the strong tier. The crux stays in its content key.
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_verdict_records_score_threshold_and_rule() -> Result<()> {
+        let verdict = r#"{"crux":"SECRET_CRUX_FROM_JUDGE","primary_rule":"UNC-1","capability_boundary":"uncertain","p_solve":0.62}"#;
+        let (run, fields) = routed_run(
+            capability_router()?,
+            "route-capability-ok",
+            judge_replies(Some(verdict)),
+        )
+        .await?;
+
+        assert_eq!(text(&run, Keys::MODE).as_deref(), Some("capability"));
+        assert_eq!(text(&run, Keys::DECIDED_BY).as_deref(), Some("judge"));
+        assert_eq!(text(&run, Keys::TIER).as_deref(), Some("strong"));
+        assert_eq!(text(&run, Keys::JUDGE_MODEL).as_deref(), Some("judge"));
+        assert_eq!(
+            text(&run, Keys::JUDGE_VERDICT_STATUS).as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            text(&run, Keys::JUDGE_PRIMARY_RULE).as_deref(),
+            Some("UNC-1")
+        );
+        assert_eq!(
+            text(&run, Keys::JUDGE_CAPABILITY_BOUNDARY).as_deref(),
+            Some("uncertain")
+        );
+        assert_eq!(
+            run.get(Keys::JUDGE_P_SOLVE),
+            Some(&opentelemetry::Value::F64(0.62))
+        );
+        let Some(opentelemetry::Value::F64(threshold)) = run.get(Keys::JUDGE_THRESHOLD) else {
+            panic!("threshold missing: {run:?}");
+        };
+        assert!((threshold - 0.7).abs() < 1e-9);
+        assert_eq!(text(&run, Keys::JUDGE_CRUX).as_deref(), Some(CRUX));
+        assert_eq!(run.get(Keys::FALLBACK_REASON), None);
+        assert_only_in_content(&run, &fields, CRUX);
+        Ok(())
+    }
+
+    /// No verdict, or one whose labels are not the enumerated ones, is labelled as a
+    /// fallback, and the judge's free text is never copied into a routing attribute.
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_or_invalid_verdicts_are_labelled_fallbacks() -> Result<()> {
+        let (run, _) = routed_run(
+            capability_router()?,
+            "route-capability-unavailable",
+            judge_replies(None),
+        )
+        .await?;
+        assert_eq!(text(&run, Keys::DECIDED_BY).as_deref(), Some("fallback"));
+        assert_eq!(
+            text(&run, Keys::FALLBACK_REASON).as_deref(),
+            Some("verdict_unavailable")
+        );
+        assert_eq!(
+            text(&run, Keys::JUDGE_VERDICT_STATUS).as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(text(&run, Keys::TIER).as_deref(), Some("strong"));
+
+        let invalid = r#"{"crux":"SECRET_CRUX_FROM_JUDGE","primary_rule":"SECRET_CRUX_FROM_JUDGE","capability_boundary":"supported","p_solve":0.9}"#;
+        let (run, fields) = routed_run(
+            capability_router()?,
+            "route-capability-invalid",
+            judge_replies(Some(invalid)),
+        )
+        .await?;
+        assert_eq!(text(&run, Keys::DECIDED_BY).as_deref(), Some("fallback"));
+        assert_eq!(
+            text(&run, Keys::FALLBACK_REASON).as_deref(),
+            Some("verdict_invalid")
+        );
+        assert_eq!(
+            text(&run, Keys::JUDGE_VERDICT_STATUS).as_deref(),
+            Some("invalid")
+        );
+        for key in [
+            Keys::JUDGE_PRIMARY_RULE,
+            Keys::JUDGE_CAPABILITY_BOUNDARY,
+            Keys::JUDGE_P_SOLVE,
+            Keys::JUDGE_CRUX,
+        ] {
+            assert_eq!(run.get(key), None, "{key}");
+        }
+        assert_only_in_content(&run, &fields, CRUX);
+        Ok(())
+    }
+
+    /// A confirmed escalation records the verdict, streak, and latch; the judge's reason
+    /// stays in its content key.
+    #[tokio::test(flavor = "current_thread")]
+    async fn escalation_records_streak_and_latch() -> Result<()> {
+        use crate::algorithms::llm_class::{LlmClassifierConfig, LlmTaskClassifier};
+        use crate::algorithms::util::DEFAULT_JUDGE_MAX_OUTPUT_TOKENS;
+        use crate::algorithms::util::classifier_contract::ClassifierContractConfig;
+        use crate::algorithms::util::escalation::EscalationJudgeConfig;
+
+        let router = Arc::new(LlmTaskClassifier::new(LlmClassifierConfig::Escalation {
+            judge_target: "judge".into(),
+            efficient_target: "efficient".into(),
+            capable_target: "capable".into(),
+            contract: ClassifierContractConfig::default(),
+            config: EscalationJudgeConfig {
+                confirmations: 1,
+                ..EscalationJudgeConfig::default()
+            },
+            max_output_tokens: DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
+        })?);
+        let verdict = r#"{"escalate":true,"reason":"SECRET_CRUX_FROM_JUDGE"}"#;
+        let (run, fields) =
+            routed_run(router, "route-escalation", judge_replies(Some(verdict))).await?;
+
+        assert_eq!(text(&run, Keys::MODE).as_deref(), Some("escalation"));
+        assert_eq!(text(&run, Keys::DECIDED_BY).as_deref(), Some("judge"));
+        assert_eq!(text(&run, Keys::TIER).as_deref(), Some("strong"));
+        assert_eq!(
+            run.get(Keys::ESCALATION_ESCALATE),
+            Some(&opentelemetry::Value::Bool(true))
+        );
+        assert_eq!(
+            run.get(Keys::ESCALATION_STREAK),
+            Some(&opentelemetry::Value::I64(1))
+        );
+        assert_eq!(
+            run.get(Keys::ESCALATION_CONFIRMATIONS),
+            Some(&opentelemetry::Value::I64(1))
+        );
+        assert_eq!(
+            run.get(Keys::ESCALATION_LATCHED),
+            Some(&opentelemetry::Value::Bool(true))
+        );
+        assert_eq!(text(&run, Keys::ESCALATION_REASON).as_deref(), Some(CRUX));
+        assert_only_in_content(&run, &fields, CRUX);
+        Ok(())
+    }
+
+    /// A custom verdict records only a configured label; an unknown label is a fallback.
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_label_is_recorded_only_when_configured() -> Result<()> {
+        use crate::algorithms::llm_class::{
+            CustomClassifierConfig, CustomClassifierPolicy, LlmClassifierConfig, LlmTaskClassifier,
+        };
+        let router = || -> Result<Arc<dyn Algorithm>> {
+            Ok(Arc::new(LlmTaskClassifier::new(
+                LlmClassifierConfig::Custom {
+                    judge_target: "judge".into(),
+                    targets: vec![
+                        ("fast".to_string(), "efficient".into()),
+                        ("deep".to_string(), "capable".into()),
+                    ],
+                    default_target: "deep".to_string(),
+                    config: CustomClassifierConfig::new(
+                        "Pick a label.",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {"label": {"type": "string"}},
+                            "required": ["label"],
+                            "additionalProperties": false
+                        }),
+                        CustomClassifierPolicy::target_selector("/label"),
+                    ),
+                },
+            )?))
+        };
+
+        let (run, _) = routed_run(
+            router()?,
+            "route-custom-known",
+            judge_replies(Some(r#"{"label":"fast"}"#)),
+        )
+        .await?;
+        assert_eq!(text(&run, Keys::MODE).as_deref(), Some("custom"));
+        assert_eq!(text(&run, Keys::CUSTOM_LABEL).as_deref(), Some("fast"));
+        assert_eq!(text(&run, Keys::DECIDED_BY).as_deref(), Some("judge"));
+
+        let (run, fields) = routed_run(
+            router()?,
+            "route-custom-unknown",
+            judge_replies(Some(r#"{"label":"SECRET_CRUX_FROM_JUDGE"}"#)),
+        )
+        .await?;
+        assert_eq!(run.get(Keys::CUSTOM_LABEL), None);
+        assert_eq!(
+            text(&run, Keys::FALLBACK_REASON).as_deref(),
+            Some("label_unknown")
+        );
+        assert_eq!(text(&run, Keys::DECIDED_BY).as_deref(), Some("fallback"));
+        assert_only_in_content(&run, &fields, CRUX);
         Ok(())
     }
 }
