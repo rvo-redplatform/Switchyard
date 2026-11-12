@@ -149,6 +149,28 @@ async fn upstream_chat(
             .into_response();
     }
     if body["stream"].as_bool() == Some(true) {
+        // Streamed forced call to the structured-output tool, with a preamble the
+        // unwrap must drop and arguments split across deltas.
+        if body["messages"][0]["content"] == "structured-output" {
+            let called = body["tool_choice"]["function"]["name"]
+                .as_str()
+                .unwrap_or("missing")
+                .to_string();
+            let events = [
+                json!({"id": "chatcmpl-so", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Sure, "}}]}).to_string(),
+                json!({"id": "chatcmpl-so", "model": model, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_so", "type": "function", "function": {"name": called, "arguments": ""}}]}}]}).to_string(),
+                json!({"id": "chatcmpl-so", "model": model, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"answer\":"}}]}}]}).to_string(),
+                json!({"id": "chatcmpl-so", "model": model, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "42}"}}]}}]}).to_string(),
+                json!({"id": "chatcmpl-so", "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14}}).to_string(),
+                "[DONE]".to_string(),
+            ];
+            let stream = futures_util::stream::iter(
+                events
+                    .into_iter()
+                    .map(|data| Ok::<Event, Infallible>(Event::default().data(data))),
+            );
+            return Sse::new(stream).into_response();
+        }
         // Streamed tool call, for the namespace-on-every-event assertions. The
         // model calls a tool by the name it was given, so echo that name back.
         if body["messages"][0]["content"] == "mcp-tool-call" {
@@ -227,6 +249,34 @@ async fn upstream_chat(
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 40, "completion_tokens": 4, "total_tokens": 44}
+        }))
+        .into_response();
+    }
+
+    // Buffered forced call to the structured-output tool.
+    if body["messages"][0]["content"] == "structured-output" {
+        let called = body["tool_choice"]["function"]["name"]
+            .as_str()
+            .unwrap_or("missing")
+            .to_string();
+        return Json(json!({
+            "id": "chatcmpl-so",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_so",
+                        "type": "function",
+                        "function": {"name": called, "arguments": "{\"answer\":42}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14}
         }))
         .into_response();
     }
@@ -3489,6 +3539,209 @@ target = "open"
     assert!(
         upstream.calls.lock().await.is_empty(),
         "media must not reach the upstream"
+    );
+    Ok(())
+}
+
+// Concatenates the `output_text` parts of a Responses `output` array.
+fn responses_output_text(output: &Value) -> String {
+    output
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "message")
+        .flat_map(|item| item["content"].as_array().cloned().unwrap_or_default())
+        .filter(|part| part["type"] == "output_text")
+        .filter_map(|part| part["text"].as_str().map(str::to_string))
+        .collect()
+}
+
+// A JSON response_format reaches the upstream as one forced tool call and comes
+// back as JSON message content, for Chat and Responses callers, buffered and
+// streamed. Caller tools alongside it are ambiguous and refused, and a target
+// without tools cannot serve it.
+#[tokio::test]
+async fn structured_output_is_served_through_a_forced_tool() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.gateway]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+
+[targets.nova]
+id = "model/nova"
+llm_client = "gateway"
+capabilities = ["text", "tools", "streaming"]
+
+[targets.plain]
+id = "model/plain"
+llm_client = "gateway"
+capabilities = ["text", "streaming"]
+
+[routes.structured]
+id = "rp-structured"
+type = "passthrough"
+target = "nova"
+
+[routes.plain]
+id = "rp-plain"
+type = "passthrough"
+target = "plain"
+"#,
+        base_url = upstream.base_url
+    ))?;
+    let app = build_switchyard_router(state);
+    let schema = json!({
+        "type": "object",
+        "properties": {"answer": {"type": "integer"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    });
+    let chat_body = |stream: bool| {
+        json!({
+            "model": "rp-structured",
+            "stream": stream,
+            "messages": [{"role": "user", "content": "structured-output"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": schema.clone(), "strict": true}
+            }
+        })
+    };
+
+    // Chat, buffered.
+    let buffered = send(&app, "POST", "/v1/chat/completions", Some(chat_body(false))).await?;
+    assert_eq!(buffered.status, StatusCode::OK, "{}", buffered.text()?);
+    let buffered = buffered.json()?;
+    let choice = &buffered["choices"][0];
+    assert_eq!(
+        choice["message"]["content"], r#"{"answer":42}"#,
+        "{buffered}"
+    );
+    assert!(choice["message"]["tool_calls"].is_null(), "{buffered}");
+    assert_eq!(choice["finish_reason"], "stop", "{buffered}");
+    {
+        let calls = upstream.calls.lock().await;
+        let sent = calls.last().ok_or("the upstream was called")?;
+        assert!(sent.get("response_format").is_none(), "{sent}");
+        assert_eq!(sent["tools"].as_array().map(Vec::len), Some(1), "{sent}");
+        assert_eq!(sent["tools"][0]["function"]["name"], "respond", "{sent}");
+        assert_eq!(sent["tools"][0]["function"]["parameters"], schema, "{sent}");
+        assert_eq!(sent["tool_choice"]["function"]["name"], "respond", "{sent}");
+    }
+
+    // Chat, streamed: the preamble is dropped and the arguments arrive as content.
+    let streamed = send(&app, "POST", "/v1/chat/completions", Some(chat_body(true))).await?;
+    assert_eq!(streamed.status, StatusCode::OK);
+    let events = sse_events(streamed.text()?);
+    let content: String = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(content, r#"{"answer":42}"#, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["choices"][0]["delta"]["tool_calls"].is_null()),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["choices"][0]["finish_reason"] == "stop"),
+        "{events:?}"
+    );
+
+    // Responses, buffered and streamed, through text.format.
+    let responses_body = |stream: bool| {
+        json!({
+            "model": "rp-structured",
+            "stream": stream,
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "structured-output"}]}],
+            "text": {"format": {
+                "type": "json_schema", "name": "answer", "schema": schema.clone(), "strict": true
+            }}
+        })
+    };
+    let buffered = send(&app, "POST", "/v1/responses", Some(responses_body(false))).await?;
+    assert_eq!(buffered.status, StatusCode::OK, "{}", buffered.text()?);
+    let buffered = buffered.json()?;
+    assert_eq!(
+        responses_output_text(&buffered["output"]),
+        r#"{"answer":42}"#,
+        "{buffered}"
+    );
+    assert!(
+        buffered["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|item| item["type"] != "function_call"),
+        "{buffered}"
+    );
+    {
+        let calls = upstream.calls.lock().await;
+        let sent = calls.last().ok_or("the upstream was called")?;
+        assert!(sent.get("response_format").is_none(), "{sent}");
+        assert_eq!(sent["tool_choice"]["function"]["name"], "respond", "{sent}");
+    }
+
+    let streamed = send(&app, "POST", "/v1/responses", Some(responses_body(true))).await?;
+    assert_eq!(streamed.status, StatusCode::OK);
+    let events = sse_events(streamed.text()?);
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .ok_or("stream produced no response.completed event")?;
+    assert_eq!(
+        responses_output_text(&completed["response"]["output"]),
+        r#"{"answer":42}"#,
+        "{completed}"
+    );
+
+    let calls_before = upstream.calls.lock().await.len();
+
+    // Caller tools next to a JSON response_format are ambiguous.
+    let mut ambiguous = chat_body(false);
+    ambiguous["tools"] = json!([{"type": "function", "function": {
+        "name": "lookup", "parameters": {"type": "object"}
+    }}]);
+    let refused = send(&app, "POST", "/v1/chat/completions", Some(ambiguous)).await?;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    let refused = refused.json()?;
+    assert_eq!(
+        refused["error"]["type"], "invalid_request_error",
+        "{refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("response_format") && message.contains("tools")),
+        "{refused}"
+    );
+
+    // A target without tools cannot serve structured output.
+    let mut plain = chat_body(false);
+    plain["model"] = json!("rp-plain");
+    let refused = send(&app, "POST", "/v1/chat/completions", Some(plain)).await?;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    let refused = refused.json()?;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("tools")),
+        "{refused}"
+    );
+
+    assert_eq!(
+        upstream.calls.lock().await.len(),
+        calls_before,
+        "refused requests must not reach the upstream"
     );
     Ok(())
 }

@@ -9,6 +9,7 @@ mod config;
 mod failure;
 mod route;
 mod runner;
+mod structured_output;
 
 pub use algorithm::{
     AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, ClassifierMode,
@@ -22,3 +23,6 @@ pub use route::{
     CallerAuthKind, CountTokensTarget, ModelCapabilities, Route, RunOutput, RunnerError,
 };
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};
+pub use structured_output::{
+    ForcedStructuredOutput, STRUCTURED_OUTPUT_TOOL, force_structured_output_tool,
+};
