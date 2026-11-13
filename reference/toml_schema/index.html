@@ -1598,7 +1598,7 @@ calls an upstream.</p>
 <td><code>reasoning</code></td>
 <td style="text-align: center;">No</td>
 <td>unset</td>
-<td>Whether <code>GET /v1/models</code> advertises reasoning support to Codex direct-provider discovery. Unset routes are advertised as non-reasoning.</td>
+<td>Whether <code>GET /v1/models</code> advertises reasoning support for this route. The OpenAI <code>data</code> entry reports unset values as <code>null</code>; Codex direct-provider discovery (<code>models</code>) advertises unset routes as non-reasoning.</td>
 </tr>
 </tbody>
 </table>

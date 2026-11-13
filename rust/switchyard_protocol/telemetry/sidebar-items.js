@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["CallRole","ResponseOrigin"],"struct":["GenericKeys","LangfuseKeys"]};
+window.SIDEBAR_ITEMS = {"enum":["CallRole","ResponseOrigin"],"struct":["GenericKeys","LangfuseKeys","RoutingDecisionKeys"]};
