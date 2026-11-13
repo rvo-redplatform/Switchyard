@@ -243,6 +243,12 @@ where
             return Ok((Classification::Scores(Vec::new()), None));
         }
         let assigned = self.assignments.lock().get(&key).cloned();
+        if assigned.is_some() {
+            crate::observability::record_routing(
+                switchyard_protocol::RoutingDecisionKeys::DECIDED_BY,
+                "affinity",
+            );
+        }
         Ok((
             Classification::Scores(match assigned {
                 Some(target) => vec![Score {

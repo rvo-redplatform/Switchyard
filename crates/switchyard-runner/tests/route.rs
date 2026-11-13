@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use switchyard_llm_client::{ClientRouter, RunObservation};
 use switchyard_protocol::{
-    LlmClientError, LlmResponse, ModelId, Request, Response, RoutedLlmClient, text_request,
-    text_response,
+    ContentBlock, LlmClientError, LlmResponse, MediaSource, ModelId, Request, Response,
+    RoutedLlmClient, text_request, text_response,
 };
-use switchyard_runner::{AlgorithmSpec, ModelCapabilities, Route};
+use switchyard_runner::{AlgorithmSpec, ModelCapabilities, Route, Runner, RunnerError};
 
 struct StubClient;
 
@@ -161,4 +161,111 @@ fn algorithm_build_reports_unknown_configured_target() {
         error.to_string(),
         "route plugin references unknown target missing"
     );
+}
+
+// Two gateway targets that differ only in reasoning, as Roundhouse stamps them.
+const CAPABILITY_ROUTES: &str = r#"
+schema_version = 1
+
+[llm_clients.gateway]
+format = "openai_chat"
+base_url = "http://gateway.invalid/v1"
+
+[targets.nova]
+id = "nova-lite"
+llm_client = "gateway"
+capabilities = ["text", "image", "tools", "caching", "streaming"]
+
+[targets.haiku]
+id = "haiku"
+llm_client = "gateway"
+capabilities = ["text", "image", "tools", "reasoning", "caching", "streaming"]
+
+[targets.judge]
+id = "judge"
+llm_client = "gateway"
+
+[routes.fast]
+id = "rp-fast"
+type = "random"
+targets = ["nova", "haiku"]
+
+[routes.cheap]
+id = "rp-cheap"
+type = "passthrough"
+target = "nova"
+
+[routes.auto]
+id = "rp-auto"
+type = "llm_classifier"
+classifier_target = "judge"
+strong_target = "haiku"
+weak_target = "nova"
+base_threshold = 0.5
+"#;
+
+fn reasoning_request() -> Request {
+    let mut llm_request = text_request(Some("rp-fast".to_string()), "think hard");
+    llm_request.reasoning.effort = Some("high".to_string());
+    Request {
+        llm_request,
+        ..Request::default()
+    }
+}
+
+#[tokio::test]
+async fn routed_targets_are_filtered_by_request_features() {
+    let runner = Runner::from_toml(CAPABILITY_ROUTES).expect("capability routes should load");
+
+    // Random never picks the target that lacks reasoning.
+    let fast = runner.route("rp-fast").expect("rp-fast is configured");
+    for _ in 0..20 {
+        let outcome = fast
+            .decide(reasoning_request())
+            .await
+            .expect("haiku supports reasoning");
+        assert_eq!(outcome.selected_model_id, "haiku");
+    }
+
+    // The classifier skips its judge when only one tier fits; no judge call is made.
+    let auto = runner.route("rp-auto").expect("rp-auto is configured");
+    let outcome = auto
+        .decide(reasoning_request())
+        .await
+        .expect("the strong tier supports reasoning");
+    assert_eq!(outcome.selected_model_id, "haiku");
+}
+
+#[tokio::test]
+async fn request_no_target_supports_is_an_invalid_request() {
+    let runner = Runner::from_toml(CAPABILITY_ROUTES).expect("capability routes should load");
+    let cheap = runner.route("rp-cheap").expect("rp-cheap is configured");
+
+    match cheap.execute(reasoning_request(), None).await {
+        Err(RunnerError::Client(LlmClientError::InvalidRequest { message, .. })) => {
+            assert!(message.contains("rp-cheap"), "{message}");
+            assert!(message.contains("reasoning"), "{message}");
+        }
+        Err(error) => panic!("expected an invalid request, got {error}"),
+        Ok(_) => panic!("nova-lite does not support reasoning"),
+    }
+
+    let mut video = text_request(Some("rp-fast".to_string()), "watch");
+    video.messages[0].content.push(ContentBlock::Video {
+        source: MediaSource::Url {
+            url: "https://example.test/clip.mp4".to_string(),
+            media_type: None,
+        },
+    });
+    let fast = runner.route("rp-fast").expect("rp-fast is configured");
+    let refused = fast
+        .decide(Request {
+            llm_request: video,
+            ..Request::default()
+        })
+        .await;
+    assert!(matches!(
+        refused,
+        Err(RunnerError::Client(LlmClientError::InvalidRequest { .. }))
+    ));
 }

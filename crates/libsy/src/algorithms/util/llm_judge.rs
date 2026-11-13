@@ -23,8 +23,9 @@ use super::classifier_contract::ClassifierContract;
 use crate::core::algorithm::Driver;
 use crate::core::classifier::{Classification, Classifier};
 use crate::core::state::State;
+use crate::observability::record_routing;
 use crate::{LibsyError, Result};
-use switchyard_protocol::{LlmClientError, Request, Response};
+use switchyard_protocol::{LlmClientError, Request, Response, RoutingDecisionKeys as Keys};
 
 /// Builds the classifier-specific message view presented to a structured judge.
 pub(crate) trait ClassifierInput: Send + Sync {
@@ -333,8 +334,21 @@ where
             });
         };
         let verdict = self.verdict(state, request, driver).await;
+        record_routing(Keys::JUDGE_MODEL, self.target.to_string());
+        // Recorded before the policy runs, so a policy that rejects the verdict can
+        // overwrite the status and give its own fallback reason.
+        if verdict.is_some() {
+            record_routing(Keys::JUDGE_VERDICT_STATUS, "ok");
+        } else {
+            record_routing(Keys::JUDGE_VERDICT_STATUS, "unavailable");
+            record_routing(Keys::FALLBACK_REASON, "verdict_unavailable");
+        }
+        let classification = self.policy.to_classification(verdict.as_ref());
+        if matches!(&classification, Classification::Scores(scores) if !scores.is_empty()) {
+            record_routing(Keys::DECIDED_BY, "judge");
+        }
         // A judge consultation is a side call, never the turn's answer.
-        Ok((self.policy.to_classification(verdict.as_ref()), None))
+        Ok((classification, None))
     }
 }
 

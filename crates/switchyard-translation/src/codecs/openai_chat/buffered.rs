@@ -16,9 +16,9 @@ use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
-    AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
-    MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
-    SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest, Message,
+    OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role, SamplingParams,
+    StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -193,6 +193,7 @@ impl FormatCodec for OpenAiChatCodec {
         }
         let mut diagnostics = Vec::new();
         validate_request_capabilities(request, &mut diagnostics, policy)?;
+        let cache_marks = AnthropicCacheMarks::of(request);
         let mut body = Map::new();
         if let Some(model) = &request.model {
             body.insert("model".to_string(), Value::String(model.clone()));
@@ -209,13 +210,28 @@ impl FormatCodec for OpenAiChatCodec {
                 "content": text_from_blocks(&instruction.content, "\n\n"),
             }));
         }
-        for message in &request.messages {
-            messages.extend(encode_message_to_openai(message, &mut diagnostics, policy)?);
+        if let Some(marker) = cache_marks.system
+            && let Some(system) = messages.last_mut()
+        {
+            mark_cache_control(system, marker);
+        }
+        for (index, message) in request.messages.iter().enumerate() {
+            let encoded = encode_message_to_openai(message, &mut diagnostics, policy)?;
+            let produced = !encoded.is_empty();
+            messages.extend(encoded);
+            if produced
+                && let Some(marker) = cache_marks.message(index)
+                && let Some(last) = messages.last_mut()
+            {
+                mark_cache_control(last, marker);
+            }
         }
         body.insert("messages".to_string(), Value::Array(messages));
 
         if !request.tools.is_empty() {
-            body.insert("tools".to_string(), encode_openai_tools(&request.tools));
+            let mut tools = encode_openai_tools(&request.tools);
+            mark_tool_cache_control(&mut tools, &cache_marks.tools);
+            body.insert("tools".to_string(), tools);
             if let Some(choice) = &request.tool_choice {
                 body.insert("tool_choice".to_string(), encode_openai_tool_choice(choice));
             }
@@ -240,6 +256,9 @@ impl FormatCodec for OpenAiChatCodec {
         }
         if let Some(format) = &request.output.response_format {
             body.insert("response_format".to_string(), format.clone());
+        }
+        if let Some(thinking) = anthropic_thinking(&request.reasoning) {
+            body.insert("thinking".to_string(), thinking.clone());
         }
         copy_openai_chat_request_extensions(&mut body, &request.extensions.fields);
 
@@ -926,6 +945,125 @@ fn message_has_tool_results(message: &Message) -> bool {
         .any(|block| matches!(block, ContentBlock::ToolResult(_)))
 }
 
+// Anthropic-shaped `thinking` settings, which the AI Gateway reads as a Chat
+// extension and maps to Bedrock's thinking field. Other reasoning shapes (such as
+// a Responses `reasoning` object) are not thinking settings and are left out.
+fn anthropic_thinking(reasoning: &ReasoningParams) -> Option<&Value> {
+    let raw = reasoning.raw.as_ref()?;
+    matches!(
+        raw.get("type").and_then(Value::as_str),
+        Some("enabled" | "disabled" | "adaptive")
+    )
+    .then_some(raw)
+}
+
+// Prompt-cache markers from a preserved Anthropic Messages body.
+//
+// The IR has no cache_control field, so the markers are read back from the
+// exact source body and placed on the matching Chat message or tool, where the
+// AI Gateway turns them into Bedrock cache points. Messages are matched by
+// index only when the source and the IR have the same number of them.
+#[derive(Default)]
+struct AnthropicCacheMarks<'a> {
+    system: Option<&'a Value>,
+    messages: Vec<Option<&'a Value>>,
+    tools: Vec<(&'a str, &'a Value)>,
+}
+
+impl<'a> AnthropicCacheMarks<'a> {
+    fn of(request: &'a LlmRequest) -> Self {
+        let Some(body) = request
+            .preservation
+            .requests
+            .get(&FormatId::from(WireFormat::AnthropicMessages))
+        else {
+            return Self::default();
+        };
+        let system = if request.instructions.len() == 1 {
+            body.get("system").and_then(last_cache_control)
+        } else {
+            None
+        };
+        let messages: Vec<Option<&'a Value>> = match body.get("messages").and_then(Value::as_array)
+        {
+            Some(source) if source.len() == request.messages.len() => source
+                .iter()
+                .map(|message| message.get("content").and_then(last_cache_control))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let tools: Vec<(&'a str, &'a Value)> = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        Some((tool.get("name")?.as_str()?, tool.get("cache_control")?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            system,
+            messages,
+            tools,
+        }
+    }
+
+    fn message(&self, index: usize) -> Option<&'a Value> {
+        self.messages.get(index).copied().flatten()
+    }
+}
+
+// The last cache_control marker in an Anthropic content block array.
+fn last_cache_control(content: &Value) -> Option<&Value> {
+    content
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|block| block.get("cache_control"))
+}
+
+// Puts `marker` on the last content part of a Chat message, turning plain
+// string content into a single text part first.
+fn mark_cache_control(message: &mut Value, marker: &Value) {
+    let Some(content) = message.get_mut("content") else {
+        return;
+    };
+    let text = match content {
+        Value::String(text) if !text.is_empty() => Some(std::mem::take(text)),
+        _ => None,
+    };
+    if let Some(text) = text {
+        *content = json!([{"type": "text", "text": text, "cache_control": marker}]);
+    } else if let Value::Array(parts) = content
+        && let Some(Value::Object(last)) = parts.last_mut()
+    {
+        last.insert("cache_control".to_string(), marker.clone());
+    }
+}
+
+// Puts each Anthropic tool's cache_control marker on the Chat tool of the same name.
+fn mark_tool_cache_control(tools: &mut Value, marks: &[(&str, &Value)]) {
+    let Some(tools) = tools.as_array_mut() else {
+        return;
+    };
+    for tool in tools {
+        let name = tool.pointer("/function/name").and_then(Value::as_str);
+        let Some(marker) = marks
+            .iter()
+            .find(|(mark, _)| Some(*mark) == name)
+            .map(|(_, marker)| (*marker).clone())
+        else {
+            continue;
+        };
+        if let Some(tool) = tool.as_object_mut() {
+            tool.insert("cache_control".to_string(), marker);
+        }
+    }
+}
+
 // Copies Chat-compatible extension fields preserved in the IR.
 fn copy_openai_chat_request_extensions(
     body: &mut Map<String, Value>,
@@ -978,6 +1116,7 @@ pub(crate) fn encode_openai_content(
     if !has_non_text {
         return Ok(Value::String(text_from_blocks(content, "\n")));
     }
+    reject_media(content)?;
     if role != Role::User {
         push_lossy(
             diagnostics,
@@ -1013,22 +1152,8 @@ pub(crate) fn encode_openai_content(
                     blocks.push(openai_text_part(&file_source_text(source)));
                 }
             },
-            ContentBlock::Audio { source } => {
-                push_lossy(
-                    diagnostics,
-                    policy,
-                    "OpenAI Chat codec does not have a stable audio request mapping yet",
-                )?;
-                blocks.push(openai_text_part(&media_source_text(source)));
-            }
-            ContentBlock::Video { source } => {
-                push_lossy(
-                    diagnostics,
-                    policy,
-                    "OpenAI Chat codec does not have a stable video request mapping yet",
-                )?;
-                blocks.push(openai_text_part(&media_source_text(source)));
-            }
+            // Refused by `reject_media` above.
+            ContentBlock::Audio { .. } | ContentBlock::Video { .. } => {}
             ContentBlock::Unknown { raw, .. } => {
                 push_lossy(
                     diagnostics,
@@ -1162,18 +1287,26 @@ fn file_source_text(source: &FileSource) -> String {
     }
 }
 
-// Converts unsupported media sources to deterministic text fallback content.
-fn media_source_text(source: &MediaSource) -> String {
-    match source {
-        MediaSource::Url { url, media_type } => json_string(&json!({
-            "url": url,
-            "media_type": media_type,
-        })),
-        MediaSource::Base64 { media_type, data } => json_string(&json!({
-            "media_type": media_type,
-            "data": data,
-        })),
-        MediaSource::Raw(raw) => json_string(raw),
+// Audio and video have no Chat request mapping, so a lossy policy would turn the
+// media into a text description the model then answers as if it were the
+// caller's words. Refuse it whatever the policy says. Provider media parts the
+// decoders keep as unknown blocks (`input_audio`, `video`, ...) count too.
+fn reject_media(content: &[ContentBlock]) -> Result<()> {
+    let kind = content.iter().find_map(|block| match block {
+        ContentBlock::Audio { .. } => Some("audio"),
+        ContentBlock::Video { .. } => Some("video"),
+        ContentBlock::Unknown { raw, .. } => match raw.get("type").and_then(Value::as_str) {
+            Some("input_audio" | "audio" | "audio_url") => Some("audio"),
+            Some("input_video" | "video" | "video_url") => Some("video"),
+            _ => None,
+        },
+        _ => None,
+    });
+    match kind {
+        Some(kind) => Err(TranslationError::LossyConversion(format!(
+            "{kind} input cannot be sent to an OpenAI Chat upstream; send text or a base64 image instead"
+        ))),
+        None => Ok(()),
     }
 }
 

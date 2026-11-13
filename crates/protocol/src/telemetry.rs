@@ -36,6 +36,58 @@ impl GenericKeys {
     pub const CALL_TARGET: &str = "switchyard.call.target";
 }
 
+/// Attribute keys explaining why a routing algorithm picked its target.
+///
+/// Every value is a bounded label, number, or boolean, except the keys in
+/// [`RoutingDecisionKeys::CONTENT`]: those carry judge-written free text derived from the
+/// request and must be handled like prompt and completion content.
+pub struct RoutingDecisionKeys;
+
+impl RoutingDecisionKeys {
+    /// Classifier mode: `capability`, `escalation`, or `custom`.
+    pub const MODE: &str = "switchyard.routing.mode";
+    /// Tier of the selected target, such as `weak` or `strong`.
+    pub const TIER: &str = "switchyard.routing.tier";
+    /// Component that decided the turn: `judge`, `affinity`, `latch`, `fallback`, or a stage
+    /// decision source such as `dimensions`.
+    pub const DECIDED_BY: &str = "switchyard.routing.decided_by";
+    /// Why the turn fell back to a default, such as `verdict_unavailable`.
+    pub const FALLBACK_REASON: &str = "switchyard.routing.fallback_reason";
+    /// Target that produced the judge verdict.
+    pub const JUDGE_MODEL: &str = "switchyard.routing.judge.model";
+    /// Judge verdict status: `ok`, `unavailable`, or `invalid`.
+    pub const JUDGE_VERDICT_STATUS: &str = "switchyard.routing.judge.verdict_status";
+    /// Capability judge's solve probability.
+    pub const JUDGE_P_SOLVE: &str = "switchyard.routing.judge.p_solve";
+    /// Solve probability the capability verdict had to reach for the efficient target.
+    pub const JUDGE_THRESHOLD: &str = "switchyard.routing.judge.threshold";
+    /// Capability boundary of a valid capability verdict.
+    pub const JUDGE_CAPABILITY_BOUNDARY: &str = "switchyard.routing.judge.capability_boundary";
+    /// Primary rule of a valid capability verdict.
+    pub const JUDGE_PRIMARY_RULE: &str = "switchyard.routing.judge.primary_rule";
+    /// Capability judge's one-line reason. Content.
+    pub const JUDGE_CRUX: &str = "switchyard.routing.judge.crux";
+    /// Whether the escalation judge asked to escalate.
+    pub const ESCALATION_ESCALATE: &str = "switchyard.routing.escalation.escalate";
+    /// Consecutive escalate verdicts after this turn.
+    pub const ESCALATION_STREAK: &str = "switchyard.routing.escalation.streak";
+    /// Escalate verdicts required to latch the session to the capable target.
+    pub const ESCALATION_CONFIRMATIONS: &str = "switchyard.routing.escalation.confirmations";
+    /// Whether the session is latched to the capable target.
+    pub const ESCALATION_LATCHED: &str = "switchyard.routing.escalation.latched";
+    /// Escalation judge's reason. Content.
+    pub const ESCALATION_REASON: &str = "switchyard.routing.escalation.reason";
+    /// Configured target label a custom verdict selected.
+    pub const CUSTOM_LABEL: &str = "switchyard.routing.custom.label";
+    /// Stage signal scorer's probability for a turn the signals resolved.
+    pub const STAGE_PROBABILITY: &str = "switchyard.routing.stage.probability";
+    /// Stage signal scorer's confidence for a turn the signals resolved.
+    pub const STAGE_CONFIDENCE: &str = "switchyard.routing.stage.confidence";
+
+    /// Keys that carry judge-written free text.
+    pub const CONTENT: &[&str] = &[Self::JUDGE_CRUX, Self::ESCALATION_REASON];
+}
+
 /// Langfuse-native metadata keys for route-selection observations.
 ///
 /// The literal key strings Langfuse expects on an observation's `metadata`
@@ -136,6 +188,25 @@ mod tests {
         assert_eq!(GenericKeys::RESPONSE_ORIGIN, "switchyard.response.origin");
         assert_eq!(GenericKeys::CALL_ROLE, "switchyard.call.role");
         assert_eq!(GenericKeys::CALL_TARGET, "switchyard.call.target");
+    }
+
+    #[test]
+    fn routing_decision_keys_stay_in_the_routing_namespace() {
+        assert_eq!(
+            RoutingDecisionKeys::DECIDED_BY,
+            "switchyard.routing.decided_by"
+        );
+        assert_eq!(
+            RoutingDecisionKeys::JUDGE_P_SOLVE,
+            "switchyard.routing.judge.p_solve"
+        );
+        assert_eq!(
+            RoutingDecisionKeys::CONTENT,
+            [
+                "switchyard.routing.judge.crux",
+                "switchyard.routing.escalation.reason"
+            ]
+        );
     }
 
     #[test]

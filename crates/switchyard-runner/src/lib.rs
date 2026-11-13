@@ -4,17 +4,25 @@
 //! Shared configured routing for Switchyard serving surfaces.
 
 mod algorithm;
+mod capabilities;
 mod config;
 mod failure;
 mod route;
 mod runner;
+mod structured_output;
 
 pub use algorithm::{
     AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, ClassifierMode,
     ClassifierPolicyConfig, LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
+};
+pub use capabilities::{
+    Capability, FilterStrategy, RequestFeatures, TargetCapabilities, TargetFilter,
 };
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
 pub use route::{
     CallerAuthKind, CountTokensTarget, ModelCapabilities, Route, RunOutput, RunnerError,
 };
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};
+pub use structured_output::{
+    ForcedStructuredOutput, STRUCTURED_OUTPUT_TOOL, force_structured_output_tool,
+};

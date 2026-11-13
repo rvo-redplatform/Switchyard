@@ -17,8 +17,9 @@ use super::llm_judge::{
 };
 use crate::core::classifier::{Classification, Score};
 use crate::core::state::State;
+use crate::observability::record_routing;
 use crate::{LibsyError, Result};
-use switchyard_protocol::Request;
+use switchyard_protocol::{Request, RoutingDecisionKeys as Keys};
 
 const PROMPT_TEMPLATE: &str = include_str!("../../prompts/escalation/prompt.md");
 const SCHEMA_TEMPLATE: &str = include_str!("../../prompts/escalation/schema.json");
@@ -88,11 +89,13 @@ impl Default for EscalationJudgeConfig {
 }
 
 /// The judge's verdict. The schema also requires a `reason`, which makes the judge state its
-/// case and measurably sharpens the verdict — routing reads only the boolean, so it is
-/// deserialized away rather than carried.
+/// case and measurably sharpens the verdict. Routing reads only the boolean; the reason is
+/// kept for telemetry as content.
 #[derive(Deserialize)]
 pub(crate) struct EscalationVerdict {
     escalate: bool,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Builds the condensed trajectory presented to the escalation judge.
@@ -125,6 +128,12 @@ impl JudgePolicy for EscalationPolicy {
     type Verdict = EscalationVerdict;
 
     fn to_classification(&self, verdict: Option<&EscalationVerdict>) -> Classification {
+        if let Some(verdict) = verdict {
+            record_routing(Keys::ESCALATION_ESCALATE, verdict.escalate);
+            if let Some(reason) = &verdict.reason {
+                record_routing(Keys::ESCALATION_REASON, reason.clone());
+            }
+        }
         match verdict {
             Some(verdict) if verdict.escalate => Classification::Scores(vec![Score {
                 target: self.capable.clone(),

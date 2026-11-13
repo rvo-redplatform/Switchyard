@@ -10,8 +10,9 @@ use serde_json::Value;
 
 use super::llm_judge::JudgePolicy;
 use crate::core::classifier::{Classification, Score};
+use crate::observability::record_routing;
 use crate::{LibsyError, Result};
-use switchyard_protocol::ModelId;
+use switchyard_protocol::{ModelId, RoutingDecisionKeys as Keys};
 
 /// Maps one string field in a validated verdict to a configured routing target.
 pub(crate) struct TargetSelectorPolicy {
@@ -42,16 +43,28 @@ impl JudgePolicy for TargetSelectorPolicy {
     type Verdict = Value;
 
     fn to_classification(&self, verdict: Option<&Self::Verdict>) -> Classification {
-        let target = verdict
-            .and_then(|verdict| self.selector.resolve(verdict).ok())
+        let Some(verdict) = verdict else {
+            return Classification::Ambiguous(vec![]);
+        };
+        // The label is judge-written, so only a configured one is recorded.
+        let selected = self
+            .selector
+            .resolve(verdict)
+            .ok()
             .and_then(Value::as_str)
-            .and_then(|label| self.targets.get(label));
-        match target {
-            Some(target) => Classification::Scores(vec![Score {
-                target: target.clone(),
-                confidence: 1.0,
-            }]),
-            None => Classification::Ambiguous(vec![]),
+            .and_then(|label| self.targets.get_key_value(label));
+        match selected {
+            Some((label, target)) => {
+                record_routing(Keys::CUSTOM_LABEL, label.clone());
+                Classification::Scores(vec![Score {
+                    target: target.clone(),
+                    confidence: 1.0,
+                }])
+            }
+            None => {
+                record_routing(Keys::FALLBACK_REASON, "label_unknown");
+                Classification::Ambiguous(vec![])
+            }
         }
     }
 }

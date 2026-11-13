@@ -9,6 +9,10 @@
 #             issuer for this repo, and a permissions policy allowing ecr push
 #             (ecr:* / ecr:GetAuthorizationToken). The make-account roles already
 #             have ECR *pull* access for the cluster; this role is for *push*.
+# Tags      : moving `main`, `sha-<short>`, and `vX.Y.Z` on release tags.
+#             No `latest`: the old agentic-flywheel prototype on rp-tools-nonprod
+#             runs switchyard-server:latest with pullPolicy Always, so retagging
+#             latest would silently swap its binary. Pin a vX.Y.Z digest instead.
 # Trigger   : push to main (moving `main` tag), push v*.*.* tags (immutable
 #             release tags), or workflow_dispatch (manual, optional `tag`).
 # Multi-arch: linux/amd64 + linux/arm64.
@@ -74,7 +78,6 @@ jobs:
             type=ref,event=branch
             type=semver,pattern=v{{version}}
             type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
