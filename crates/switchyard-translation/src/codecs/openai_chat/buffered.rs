@@ -1044,7 +1044,12 @@ fn mark_cache_control(message: &mut Value, marker: &Value) {
     }
 }
 
-// Puts each Anthropic tool's cache_control marker on the Chat tool of the same name.
+// Puts each Anthropic tool's cache_control marker on the function definition
+// of the Chat tool of the same name. Envoy AI Gateway reads it from
+// `tools[i].function.cache_control` (FunctionDefinition embeds
+// AnthropicContentFields; the Tool wrapper does not) and ignores a marker at
+// `tools[i].cache_control`. See internal/translator/converse_helper.go:52 and
+// anthropic_helper.go:190 in EAIG v1.1.0.
 fn mark_tool_cache_control(tools: &mut Value, marks: &[(&str, &Value)]) {
     let Some(tools) = tools.as_array_mut() else {
         return;
@@ -1058,8 +1063,8 @@ fn mark_tool_cache_control(tools: &mut Value, marks: &[(&str, &Value)]) {
         else {
             continue;
         };
-        if let Some(tool) = tool.as_object_mut() {
-            tool.insert("cache_control".to_string(), marker);
+        if let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) {
+            function.insert("cache_control".to_string(), marker);
         }
     }
 }

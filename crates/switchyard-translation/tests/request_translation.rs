@@ -2296,7 +2296,7 @@ fn anthropic_thinking_is_dropped_from_responses_input() -> TestResult {
 }
 
 // Anthropic prompt-cache markers survive translation to OpenAI Chat on the
-// matching system message, conversation message, and tool.
+// matching system message, conversation message, and tool function definition.
 #[test]
 fn anthropic_cache_control_is_carried_to_openai_chat() -> TestResult {
     let engine = TranslationEngine::default();
@@ -2338,8 +2338,12 @@ fn anthropic_cache_control_is_carried_to_openai_chat() -> TestResult {
     );
     assert_eq!(output["messages"][2]["content"], "First answer.");
     assert_eq!(output["messages"][3]["content"], "Second question.");
+    // The gateway reads tool markers from the function definition only.
     assert!(output["tools"][0].get("cache_control").is_none());
-    assert_eq!(output["tools"][1]["cache_control"], marker);
+    assert!(output["tools"][0]["function"].get("cache_control").is_none());
+    assert!(output["tools"][1].get("cache_control").is_none());
+    assert_eq!(output["tools"][1]["function"]["name"], "cached");
+    assert_eq!(output["tools"][1]["function"]["cache_control"], marker);
     assert_eq!(output["thinking"], json!({"type": "disabled"}));
     Ok(())
 }
