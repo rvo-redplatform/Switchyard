@@ -2524,7 +2524,10 @@ mod tests {
             .await
             .ok_or("request recording should be enabled")?;
         let sent: Value = serde_json::from_slice(
-            &received.first().ok_or("expected one upstream request")?.body,
+            &received
+                .first()
+                .ok_or("expected one upstream request")?
+                .body,
         )?;
         assert_eq!(
             sent["messages"][2]["content"][0]["cache_control"],
