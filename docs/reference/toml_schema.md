@@ -47,6 +47,7 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `forward_auth` | No | `false` | Forward the caller's provider credential to this upstream. |
 | `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
+| `auto_cache_breakpoints` | No | `false` | `openai_chat` only: add prompt-cache breakpoints to requests that carry no `cache_control`. See [Automatic cache breakpoints](#automatic-cache-breakpoints). |
 
 The TOML never contains the secret itself. `api_key_env` names a variable that
 must exist and be non-empty when the server loads.
@@ -74,6 +75,34 @@ forwarding client used by a route, including classifier and judge targets. The
 server rejects an Anthropic forwarding route called through an OpenAI endpoint,
 or an OpenAI forwarding route called through an Anthropic endpoint, before it
 calls an upstream.
+
+### Automatic cache breakpoints
+
+Some clients never mark their prompts for caching, so a gateway that caches
+only marked content (such as Envoy AI Gateway in front of Bedrock) never
+caches them. Set `auto_cache_breakpoints = true` on an `openai_chat` client to
+mark such requests:
+
+```toml
+[llm_clients.gateway]
+format = "openai_chat"
+base_url = "http://gateway.example/v1"
+auto_cache_breakpoints = true
+```
+
+A request that has no `cache_control` marker anywhere gets at most three
+`{"type": "ephemeral"}` markers:
+
+1. the last `system` or `developer` message. String content becomes a single
+   text part, because a gateway does not cache string system content.
+2. the last tool definition, at `tools[-1].function.cache_control`.
+3. the final message. When that is a `role: tool` result, the marker moves to
+   the next or the previous user or assistant part, the same way a client's
+   own tool-result marker moves.
+
+A request that already has any marker is sent unchanged, and the other formats
+ignore this key. Cache writes are billed above the plain input rate, so enable
+it only for clients whose requests repeat a long prefix.
 
 ## `[targets.<name>]`
 

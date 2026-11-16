@@ -438,6 +438,8 @@ struct LlmClientConfig {
     extra_headers: BTreeMap<String, String>,
     #[serde(default = "default_max_retries")]
     max_retries: u32,
+    #[serde(default)]
+    auto_cache_breakpoints: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -542,6 +544,7 @@ fn build_backend(
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         max_retries: config.max_retries,
+        auto_cache_breakpoints: config.auto_cache_breakpoints,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -1372,6 +1375,32 @@ target = "azure"
             return Err(RunnerError::configuration("primary llm client is missing"));
         };
         assert_eq!(primary.max_retries, MAX_CONFIGURED_RETRIES);
+        Ok(())
+    }
+
+    // `auto_cache_breakpoints` is off unless set, and a set value reaches the backend.
+    #[test]
+    fn auto_cache_breakpoints_defaults_off_and_reaches_the_backend() -> RunnerResult<()> {
+        let default: DeploymentConfig = toml::from_str(VALID_CONFIG).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse default config: {error}"))
+        })?;
+        let Some(primary) = default.llm_clients.get("primary") else {
+            return Err(RunnerError::configuration("primary llm client is missing"));
+        };
+        assert!(!build_backend("primary", primary, &BTreeMap::new())?.auto_cache_breakpoints());
+
+        let enabled = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            "base_url = \"https://example.test/v1\"\nauto_cache_breakpoints = true",
+            1,
+        );
+        let config: DeploymentConfig = toml::from_str(&enabled).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse auto cache config: {error}"))
+        })?;
+        let Some(primary) = config.llm_clients.get("primary") else {
+            return Err(RunnerError::configuration("primary llm client is missing"));
+        };
+        assert!(build_backend("primary", primary, &BTreeMap::new())?.auto_cache_breakpoints());
         Ok(())
     }
 

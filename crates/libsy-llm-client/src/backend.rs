@@ -56,6 +56,13 @@ pub struct HttpBackendConfig {
     pub extra_body: BTreeMap<String, Value>,
     /// Additional attempts after the initial upstream request.
     pub max_retries: u32,
+    /// Adds prompt-cache breakpoints to OpenAI Chat requests that carry none.
+    ///
+    /// When set, a request with no `cache_control` marker gets at most three:
+    /// on the last system message, the last tool definition, and the final
+    /// message. Other wire formats ignore it. Cache writes cost more than plain
+    /// input, so it is off by default.
+    pub auto_cache_breakpoints: bool,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -67,6 +74,7 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
             .field("max_retries", &self.max_retries)
+            .field("auto_cache_breakpoints", &self.auto_cache_breakpoints)
             .finish()
     }
 }
@@ -255,6 +263,11 @@ impl Backend {
         self.config().max_retries
     }
 
+    /// Whether markerless OpenAI Chat requests get automatic cache breakpoints.
+    pub fn auto_cache_breakpoints(&self) -> bool {
+        self.config().auto_cache_breakpoints
+    }
+
     /// Whether this backend speaks the Anthropic Messages wire format — the only
     /// one with a `count_tokens` endpoint.
     pub fn is_anthropic(&self) -> bool {
@@ -346,6 +359,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             max_retries: 0,
+            auto_cache_breakpoints: false,
         }
     }
 
