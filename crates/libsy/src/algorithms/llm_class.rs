@@ -1596,7 +1596,10 @@ mod tests {
         assert_eq!(tool.name, switchyard_protocol::STRUCTURED_OUTPUT_TOOL);
         assert_eq!(
             Some(&tool.parameters),
-            judge.contract().response_format().pointer("/json_schema/schema")
+            judge
+                .contract()
+                .response_format()
+                .pointer("/json_schema/schema")
         );
         assert_eq!(
             judge_request.llm_request.tool_choice,

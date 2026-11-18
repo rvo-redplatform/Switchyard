@@ -2340,7 +2340,11 @@ fn anthropic_cache_control_is_carried_to_openai_chat() -> TestResult {
     assert_eq!(output["messages"][3]["content"], "Second question.");
     // The gateway reads tool markers from the function definition only.
     assert!(output["tools"][0].get("cache_control").is_none());
-    assert!(output["tools"][0]["function"].get("cache_control").is_none());
+    assert!(
+        output["tools"][0]["function"]
+            .get("cache_control")
+            .is_none()
+    );
     assert!(output["tools"][1].get("cache_control").is_none());
     assert_eq!(output["tools"][1]["function"]["name"], "cached");
     assert_eq!(output["tools"][1]["function"]["cache_control"], marker);

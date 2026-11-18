@@ -2653,7 +2653,10 @@ mod tests {
         assert!(body["tools"][0]["function"].get("cache_control").is_none());
         // The assistant has only tool calls, so the final message's marker
         // moves back to the user message.
-        assert_eq!(body["messages"][1]["content"][0]["cache_control"], ephemeral);
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            ephemeral
+        );
         assert!(!has_tool_cache_marker(&body["messages"][3]));
         assert_eq!(count_cache_control_blocks(&body), 3);
     }
@@ -2674,7 +2677,11 @@ mod tests {
         });
         add_auto_cache_breakpoints(&mut body);
         relocate_tool_cache_markers(&mut body);
-        assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
         assert_eq!(
             body["messages"][0]["content"][1]["cache_control"],
             json!({"type": "ephemeral"})
@@ -2751,9 +2758,15 @@ mod tests {
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let sent = sent_chat_body(true, unmarked_agent_turn()).await?;
         let ephemeral = json!({"type": "ephemeral"});
-        assert_eq!(sent["messages"][0]["content"][0]["cache_control"], ephemeral);
+        assert_eq!(
+            sent["messages"][0]["content"][0]["cache_control"],
+            ephemeral
+        );
         assert_eq!(sent["tools"][1]["function"]["cache_control"], ephemeral);
-        assert_eq!(sent["messages"][1]["content"][0]["cache_control"], ephemeral);
+        assert_eq!(
+            sent["messages"][1]["content"][0]["cache_control"],
+            ephemeral
+        );
         assert!(!has_tool_cache_marker(&sent["messages"][3]));
         assert_eq!(count_cache_control_blocks(&sent), 3);
         Ok(())

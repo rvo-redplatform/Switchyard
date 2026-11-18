@@ -926,7 +926,10 @@ mod tests {
         let logs = logs.contents();
         assert!(logs.contains("parse_error"), "{logs}");
         assert!(logs.contains("reply_shape=\"text\""), "{logs}");
-        assert!(logs.contains(&format!("reply_len={}", REPLY.len())), "{logs}");
+        assert!(
+            logs.contains(&format!("reply_len={}", REPLY.len())),
+            "{logs}"
+        );
         assert!(!logs.contains("private analysis"), "{logs}");
         Ok(())
     }

@@ -1583,7 +1583,10 @@ prompt = "CUSTOM STAGE"
             .ok_or("classifier prompt was not text")?;
         assert!(prompt.starts_with(prompt_prefix), "{route}: {prompt}");
         if json_object {
-            assert!(judge_call.get("response_format").is_none(), "{route}: {judge_call}");
+            assert!(
+                judge_call.get("response_format").is_none(),
+                "{route}: {judge_call}"
+            );
             assert_eq!(
                 judge_call["tools"][0]["function"]["parameters"],
                 json!({"type": "object", "additionalProperties": true}),

@@ -78,7 +78,10 @@ pub fn force_structured_output_tool(
         return Ok(None);
     };
     if !request.tools.is_empty() {
-        let format_type = format.get("type").and_then(Value::as_str).unwrap_or_default();
+        let format_type = format
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         return Err(invalid_request(format!(
             "response_format {format_type} cannot be combined with tools: structured output is \
              served through a forced tool call, so send either tools or response_format, not both"
