@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use switchyard_protocol::{
-    AggLlmResponse, InstructionBlock, LlmRequest, Message, ModelId, OutputParams, Role,
-    completion_text,
+    AggLlmResponse, ContentBlock, InstructionBlock, LlmRequest, Message, ModelId, OutputParams,
+    Role, STRUCTURED_OUTPUT_TOOL, ToolChoice, completion_text, structured_output_tool,
 };
 
 use super::robustness::{safe_client_error, safe_error_summary};
@@ -158,21 +158,33 @@ where
 
     fn build_request(&self, state: &State, request: &Request) -> Request {
         let messages = self.input.build_messages(state, request);
-        Request {
-            llm_request: LlmRequest {
-                model: request.llm_request.model.clone(),
-                instructions: vec![InstructionBlock {
-                    role: Role::System,
-                    content: Message::text(Role::System, self.contract.system_prompt().to_string())
-                        .content,
-                }],
-                messages,
-                output: OutputParams {
-                    max_output_tokens: Some(self.runtime.max_output_tokens),
-                    response_format: Some(self.contract.response_format().clone()),
-                },
-                ..LlmRequest::default()
+        let mut llm_request = LlmRequest {
+            model: request.llm_request.model.clone(),
+            instructions: vec![InstructionBlock {
+                role: Role::System,
+                content: Message::text(Role::System, self.contract.system_prompt().to_string())
+                    .content,
+            }],
+            messages,
+            output: OutputParams {
+                max_output_tokens: Some(self.runtime.max_output_tokens),
+                response_format: Some(self.contract.response_format().clone()),
             },
+            ..LlmRequest::default()
+        };
+        // Gateways that translate to other providers can drop `response_format` (Envoy AI
+        // Gateway's Chat-to-Converse path does), but a forced tool call survives translation.
+        // The verdict schema is therefore sent as the only tool, and the judge must call it.
+        // A contract whose schema cannot be tool parameters keeps the plain `response_format`.
+        if let Ok(Some(tool)) = structured_output_tool(self.contract.response_format()) {
+            llm_request.tools = vec![tool];
+            llm_request.tool_choice = Some(ToolChoice::Tool {
+                name: STRUCTURED_OUTPUT_TOOL.to_string(),
+            });
+            llm_request.output.response_format = None;
+        }
+        Request {
+            llm_request,
             raw_request: None,
             metadata: request.metadata.clone(),
         }
@@ -268,10 +280,41 @@ where
             .ok()?;
         self.judge
             .parse(&aggregate)
-            .inspect_err(|error| {
-                report_fail_open(judge_model, safe_error_summary(error), "parse_error")
-            })
+            .inspect_err(|error| report_parse_failure(judge_model, error, &aggregate))
             .ok()
+    }
+}
+
+/// Logs and counts a judge reply that did not parse into a verdict.
+///
+/// The log carries the reply's shape and byte length so a parse failure can be told apart
+/// from an empty reply or a model that ignored the forced tool, but never the reply itself:
+/// it can quote the conversation back.
+fn report_parse_failure(judge_model: &str, error: &LibsyError, response: &AggLlmResponse) {
+    let (reply_shape, reply_len) = reply_shape(response);
+    tracing::warn!(
+        target: "libsy",
+        judge_model,
+        reason = "parse_error",
+        reply_shape,
+        reply_len,
+        error = %safe_error_summary(error),
+        "judge verdict unavailable; routing without one"
+    );
+    crate::observability::record_classifier_fail_open(judge_model, "parse_error");
+}
+
+/// Classifies a judge reply as `tool_call`, `text` or `empty`, with the byte length of the
+/// part the parser reads.
+fn reply_shape(response: &AggLlmResponse) -> (&'static str, usize) {
+    if let Some(arguments) = forced_tool_arguments(response) {
+        return ("tool_call", arguments_text(arguments).len());
+    }
+    let text = completion_text(response);
+    if text.trim().is_empty() {
+        ("empty", text.len())
+    } else {
+        ("text", text.len())
     }
 }
 
@@ -352,15 +395,49 @@ where
     }
 }
 
+/// Parses the verdict from the forced response tool's arguments, or else from the reply text.
+///
+/// The text path serves providers that honour `response_format` or ignore the forced tool.
 fn parse_json_verdict<T: DeserializeOwned>(response: &AggLlmResponse) -> Result<T> {
-    // Providers sometimes wrap otherwise valid JSON in a Markdown fence.
-    let reply = completion_text(response);
-    serde_json::from_str(strip_json_fence(reply.trim())).map_err(|err| LibsyError::AlgorithmError {
+    let parsed = match forced_tool_arguments(response) {
+        // Arguments that did not parse as JSON upstream are kept as the raw string.
+        Some(Value::String(raw)) => serde_json::from_str(strip_json_fence(raw.trim())),
+        Some(arguments) => serde_json::from_value(arguments.clone()),
+        None => {
+            // Providers sometimes wrap otherwise valid JSON in a Markdown fence.
+            let reply = completion_text(response);
+            serde_json::from_str(strip_json_fence(reply.trim()))
+        }
+    };
+    parsed.map_err(|err| LibsyError::AlgorithmError {
         message: format!(
             "judge reply did not parse as {}: {err}",
             std::any::type_name::<T>()
         ),
     })
+}
+
+/// Returns the arguments of the first call to the response tool in the first output.
+fn forced_tool_arguments(response: &AggLlmResponse) -> Option<&Value> {
+    response
+        .outputs
+        .first()?
+        .content
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::ToolCall(call) if call.name == STRUCTURED_OUTPUT_TOOL => {
+                Some(&call.arguments)
+            }
+            _ => None,
+        })
+}
+
+// The tool arguments as the JSON text the parser reads.
+fn arguments_text(arguments: &Value) -> String {
+    match arguments {
+        Value::String(raw) => raw.clone(),
+        other => other.to_string(),
+    }
 }
 
 fn strip_json_fence(text: &str) -> &str {
@@ -379,7 +456,9 @@ mod tests {
     use futures::StreamExt;
     use http::StatusCode;
     use serde::Deserialize;
-    use switchyard_protocol::{ContentBlock, LlmClientError, text_request, text_response};
+    use switchyard_protocol::{
+        LlmClientError, ResponseOutput, ToolCall, text_request, text_response,
+    };
 
     use crate::core::algorithm::Step;
     use crate::core::classifier::Score;
@@ -695,6 +774,172 @@ mod tests {
             "unexpected error: {error}"
         );
         Ok(())
+    }
+
+    /// Passes the caller's messages through unchanged.
+    struct EchoInput;
+
+    impl ClassifierInput for EchoInput {
+        fn build_messages(&self, _state: &State, request: &Request) -> Vec<Message> {
+            request.llm_request.messages.clone()
+        }
+    }
+
+    fn verdict_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": false
+        })
+    }
+
+    fn structured_judge() -> Result<StructuredJudge<EchoInput, SerdeDecoder<TestVerdict>>> {
+        use super::super::classifier_contract::ClassifierContractConfig;
+
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": "TestVerdict", "strict": true, "schema": verdict_schema()}
+        });
+        let contract = ClassifierContract::from_config(
+            &ClassifierContractConfig::default(),
+            "Judge the task.",
+            &response_format.to_string(),
+        )?;
+        Ok(StructuredJudge::new(
+            EchoInput,
+            contract,
+            SerdeDecoder::new(),
+            JudgeRuntimeConfig::new(256)?,
+        ))
+    }
+
+    fn tool_call_response(arguments: Value) -> AggLlmResponse {
+        AggLlmResponse {
+            outputs: vec![ResponseOutput {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".to_string(),
+                    name: STRUCTURED_OUTPUT_TOOL.to_string(),
+                    arguments,
+                })],
+                stop_reason: None,
+            }],
+            ..AggLlmResponse::default()
+        }
+    }
+
+    #[test]
+    fn a_structured_judge_forces_the_verdict_tool() -> Result<()> {
+        // The schema travels as the one forced tool, because gateways may drop
+        // `response_format` on the way to the provider.
+        let built = structured_judge()?.build_request(&State::default(), &request());
+        let llm_request = &built.llm_request;
+
+        assert_eq!(llm_request.tools.len(), 1);
+        assert_eq!(llm_request.tools[0].name, STRUCTURED_OUTPUT_TOOL);
+        assert_eq!(llm_request.tools[0].parameters, verdict_schema());
+        assert_eq!(llm_request.tools[0].strict, Some(true));
+        assert_eq!(
+            llm_request.tool_choice,
+            Some(ToolChoice::Tool {
+                name: STRUCTURED_OUTPUT_TOOL.to_string()
+            })
+        );
+        assert_eq!(llm_request.output.response_format, None);
+        assert_eq!(llm_request.output.max_output_tokens, Some(256));
+        Ok(())
+    }
+
+    #[test]
+    fn a_forced_tool_call_parses_into_the_verdict() -> Result<()> {
+        let judge = structured_judge()?;
+        // Decoded arguments, and arguments the codec kept as raw JSON text.
+        for arguments in [
+            serde_json::json!({"ok": true}),
+            Value::String(r#"{"ok":true}"#.to_string()),
+        ] {
+            assert_eq!(
+                judge.parse(&tool_call_response(arguments))?,
+                TestVerdict { ok: true }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_json_text_reply_still_parses() -> Result<()> {
+        // Providers that honour `response_format`, or ignore the forced tool, answer in text.
+        let judge = structured_judge()?;
+        assert_eq!(
+            judge.parse(&text_response(None, VERDICT))?,
+            TestVerdict { ok: true }
+        );
+        Ok(())
+    }
+
+    /// Collects formatted log output in memory.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut buffer) = self.0.lock() {
+                buffer.extend_from_slice(bytes);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        fn contents(&self) -> String {
+            self.0
+                .lock()
+                .map(|buffer| String::from_utf8_lossy(&buffer).into_owned())
+                .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn a_free_text_reply_logs_its_shape_but_not_its_content() -> Result<()> {
+        // The reply can quote the conversation, so the log names its shape and length only.
+        const REPLY: &str = "Here is my private analysis of the task";
+        let response = text_response(None, REPLY);
+        let error = structured_judge()?
+            .parse(&response)
+            .expect_err("free text is not a verdict");
+
+        let logs = LogBuffer::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            report_parse_failure("judge", &error, &response);
+        });
+
+        let logs = logs.contents();
+        assert!(logs.contains("parse_error"), "{logs}");
+        assert!(logs.contains("reply_shape=\"text\""), "{logs}");
+        assert!(logs.contains(&format!("reply_len={}", REPLY.len())), "{logs}");
+        assert!(!logs.contains("private analysis"), "{logs}");
+        Ok(())
+    }
+
+    #[test]
+    fn reply_shapes_are_bounded_labels() {
+        assert_eq!(
+            reply_shape(&tool_call_response(serde_json::json!({"ok": true}))),
+            ("tool_call", r#"{"ok":true}"#.len())
+        );
+        assert_eq!(reply_shape(&text_response(None, "hi")), ("text", 2));
+        assert_eq!(reply_shape(&text_response(None, "  ")), ("empty", 2));
+        assert_eq!(reply_shape(&AggLlmResponse::default()), ("empty", 0));
     }
 
     #[test]

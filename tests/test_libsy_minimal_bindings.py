@@ -210,9 +210,10 @@ async def test_classifier_config_accepts_a_prompt_override() -> None:
 
     prompt = judge.calls[0]["instructions"][0]["content"][0]["text"]
     assert prompt == "Custom capability rubric."
-    assert judge.calls[0]["output"]["response_format"]["json_schema"]["schema"][
-        "properties"
-    ]["p_solve"]
+    # The verdict schema is sent as the one forced tool, not as response_format.
+    assert judge.calls[0]["output"]["response_format"] is None
+    assert judge.calls[0]["tool_choice"] == {"type": "tool", "data": {"name": "respond"}}
+    assert judge.calls[0]["tools"][0]["parameters"]["properties"]["p_solve"]
     assert response["model"] == "weak"
 
 
@@ -302,7 +303,11 @@ async def test_classifier_config_accepts_json_object_output() -> None:
         },
     )
 
-    assert judge.calls[0]["output"]["response_format"] == {"type": "json_object"}
+    assert judge.calls[0]["output"]["response_format"] is None
+    assert judge.calls[0]["tools"][0]["parameters"] == {
+        "type": "object",
+        "additionalProperties": True,
+    }
     prompt = judge.calls[0]["instructions"][0]["content"][0]["text"]
     assert "JSON Schema" in prompt
     assert '"p_solve"' in prompt

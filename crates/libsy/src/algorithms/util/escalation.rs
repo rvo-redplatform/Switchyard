@@ -398,7 +398,12 @@ mod tests {
             built.llm_request.output.max_output_tokens,
             Some(super::super::DEFAULT_JUDGE_MAX_OUTPUT_TOKENS)
         );
-        assert!(built.llm_request.output.response_format.is_some());
+        assert_eq!(
+            built.llm_request.tool_choice,
+            Some(switchyard_protocol::ToolChoice::Tool {
+                name: switchyard_protocol::STRUCTURED_OUTPUT_TOOL.to_string()
+            })
+        );
         Ok(())
     }
 

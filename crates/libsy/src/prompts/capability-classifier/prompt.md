@@ -52,8 +52,10 @@ any boundary.
 
 # Output
 
-Return exactly one JSON object matching the response schema supplied with the
-request. Do not include markdown or commentary.
+Give your verdict by calling the `respond` tool supplied with the request. Its
+arguments are exactly one JSON object matching the response schema. If no tool
+is supplied, reply with that JSON object alone. Do not include markdown or
+commentary.
 
 p_solve must be between 0.00 and 1.00. p_fail is exactly 1.00 - p_solve and
 must not be emitted separately. Do not output recommended_route, confidence,
