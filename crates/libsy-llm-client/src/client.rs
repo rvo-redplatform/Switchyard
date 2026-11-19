@@ -227,6 +227,12 @@ impl TranslatingLlmClient {
             enable_anthropic_prompt_caching(&mut body);
         }
         if matches!(backend, Backend::OpenAiChat(_)) {
+            // Auto breakpoints go first so a marker added to a final tool
+            // result is moved by the relocation step like a client's own.
+            if backend.auto_cache_breakpoints() {
+                add_auto_cache_breakpoints(&mut body);
+            }
+            relocate_tool_cache_markers(&mut body);
             ensure_openai_stream_usage(&mut body);
         }
         let streaming = endpoint.allows_streaming()
@@ -864,6 +870,180 @@ fn enable_anthropic_prompt_caching(body: &mut Value) {
     }
 }
 
+// Content-part types an OpenAI-to-Bedrock gateway (Envoy AI Gateway) follows
+// with a Converse cachePoint when the part carries `cache_control`, per role.
+// `role: tool` has none: tool results become `toolResult` blocks with no
+// cachePoint, so a breakpoint there never reaches Bedrock.
+fn cache_anchor_types(message: &Value) -> &'static [&'static str] {
+    match message.get("role").and_then(Value::as_str) {
+        Some("user") => &["text", "image_url"],
+        Some("assistant") => &["text", "thinking", "redacted_thinking", "refusal"],
+        Some("system" | "developer") => &["text"],
+        _ => &[],
+    }
+}
+
+// Where a moved breakpoint lands in a message: `None` for a non-empty string
+// content (it becomes a single text part), else the last anchorable part.
+fn cache_anchor(message: &Value) -> Option<Option<usize>> {
+    let types = cache_anchor_types(message);
+    if types.is_empty() {
+        return None;
+    }
+    match message.get("content")? {
+        Value::String(text) if !text.is_empty() => Some(None),
+        Value::Array(parts) => parts
+            .iter()
+            .rposition(|part| {
+                part.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| types.contains(&kind))
+            })
+            .map(Some),
+        _ => None,
+    }
+}
+
+// Removes every `cache_control` marker from a `role: tool` message (message
+// level or on content parts) and returns the last one.
+fn take_tool_cache_marker(message: &mut Value) -> Option<Value> {
+    let mut marker = message
+        .as_object_mut()
+        .and_then(|object| object.remove("cache_control"));
+    if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+        for part in parts.iter_mut().filter_map(Value::as_object_mut) {
+            if let Some(found) = part.remove("cache_control") {
+                marker = Some(found);
+            }
+        }
+    }
+    marker
+}
+
+fn has_tool_cache_marker(message: &Value) -> bool {
+    message.get("cache_control").is_some()
+        || message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| parts.iter().any(|part| part.get("cache_control").is_some()))
+}
+
+// Moves a client's prompt-cache breakpoint off `role: tool` messages onto the
+// nearest part the gateway does turn into a Bedrock cachePoint.
+//
+// The gateway turns a run of tool messages into one Bedrock user message of
+// `toolResult` blocks and drops their markers, so agent loops (whose moving
+// breakpoint sits on the latest tool result) never cache their history.
+// Converse requires user/assistant alternation, so no message can be added
+// after the tool results; the marker moves instead. First choice is just
+// after: a `role: user` message that directly follows the run, which caches
+// through the tool results. Otherwise just before: the nearest earlier
+// anchorable part, normally the calling assistant's text. A target part that is
+// already marked keeps its own marker, so the breakpoint count never grows.
+// A body with no marker on a tool message is left untouched.
+fn relocate_tool_cache_markers(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let is_tool = |message: &Value| message.get("role").and_then(Value::as_str) == Some("tool");
+    for index in 0..messages.len() {
+        if !is_tool(&messages[index]) || !has_tool_cache_marker(&messages[index]) {
+            continue;
+        }
+        let after = (index + 1..messages.len())
+            .find(|&next| !is_tool(&messages[next]))
+            .filter(|&next| messages[next].get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|next| cache_anchor(&messages[next]).map(|part| (next, part)));
+        let target = after.or_else(|| {
+            (0..index)
+                .rev()
+                .find_map(|prev| cache_anchor(&messages[prev]).map(|part| (prev, part)))
+        });
+        let Some((target, part)) = target else {
+            continue;
+        };
+        let Some(marker) = take_tool_cache_marker(&mut messages[index]) else {
+            continue;
+        };
+        if let Some(content) = messages[target].get_mut("content") {
+            insert_cache_marker(content, part, marker);
+        }
+    }
+}
+
+// Puts `marker` on the anchor part `cache_anchor` found: a string content
+// becomes one marked text part, and an already-marked part keeps its marker.
+fn insert_cache_marker(content: &mut Value, part: Option<usize>, marker: Value) {
+    match (part, content) {
+        (None, content @ Value::String(_)) => {
+            let text = std::mem::take(content);
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": marker
+            }]);
+        }
+        (Some(part), Value::Array(parts)) => {
+            if let Some(part) = parts.get_mut(part).and_then(Value::as_object_mut) {
+                part.entry("cache_control".to_string()).or_insert(marker);
+            }
+        }
+        _ => {}
+    }
+}
+
+// Adds prompt-cache breakpoints to an OpenAI Chat request that carries none,
+// for clients that never mark their prompts.
+//
+// At most three, inside the four-breakpoint cap: the last system or developer
+// message (as an array part, because the gateway gives string system content
+// no cachePoint), the last tool definition at `function.cache_control` (the
+// only place the gateway reads a tool marker), and the final message. A final
+// `role: tool` message is marked on the message itself, so the relocation step
+// that runs next moves the marker to a part the gateway caches. A request
+// with any marker already is left untouched: its caller chose its breakpoints.
+fn add_auto_cache_breakpoints(body: &mut Value) {
+    if count_cache_control_blocks(body) > 0 {
+        return;
+    }
+    let marker = || serde_json::json!({"type": "ephemeral"});
+    if let Some(function) = body
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .and_then(|tools| tools.last_mut())
+        .and_then(|tool| tool.get_mut("function"))
+        .and_then(Value::as_object_mut)
+    {
+        function.insert("cache_control".to_string(), marker());
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let system = messages.iter().rposition(|message| {
+        matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("system" | "developer")
+        )
+    });
+    let last = messages.len().checked_sub(1);
+    // When the final message is the system message, the second pass finds its
+    // part already marked and adds nothing.
+    for index in system.into_iter().chain(last) {
+        let message = &mut messages[index];
+        if message.get("role").and_then(Value::as_str) == Some("tool") {
+            if let Some(object) = message.as_object_mut() {
+                object.insert("cache_control".to_string(), marker());
+            }
+            continue;
+        }
+        if let Some(part) = cache_anchor(message)
+            && let Some(content) = message.get_mut("content")
+        {
+            insert_cache_marker(content, part, marker());
+        }
+    }
+}
+
 // Requests streamed Chat usage by default while preserving an explicit caller choice.
 fn ensure_openai_stream_usage(body: &mut Value) {
     let Value::Object(object) = body else {
@@ -919,6 +1099,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             max_retries: 0,
+            auto_cache_breakpoints: false,
         }
     }
 
@@ -944,6 +1125,14 @@ mod tests {
     ) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.extra_body = extra_body;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn chat_map_with_auto_cache(base_url: &str, auto_cache_breakpoints: bool) -> Vec<ModelConfig> {
+        let backend = HttpBackendConfig {
+            auto_cache_breakpoints,
+            ..config(base_url)
+        };
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
@@ -2274,6 +2463,341 @@ mod tests {
                 WireFormat::OpenAiChat,
             )
             .await?;
+        Ok(())
+    }
+
+    // An agent-loop turn in OpenAI Chat form: the client's moving breakpoint is
+    // on the latest tool result.
+    fn tool_loop_body(tool_marked: bool) -> Value {
+        let mut tool_part = json!({"type": "text", "text": "file contents"});
+        if tool_marked {
+            tool_part["cache_control"] = json!({"type": "ephemeral"});
+        }
+        json!({
+            "model": "gpt",
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "user", "content": "read the file"},
+                {"role": "assistant", "content": "Reading it.", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "read", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": [tool_part]}
+            ]
+        })
+    }
+
+    // A marker on the last tool message moves onto the calling assistant's text,
+    // the nearest part the gateway turns into a Bedrock cachePoint.
+    #[test]
+    fn tool_cache_marker_moves_to_the_calling_assistant() {
+        let mut body = tool_loop_body(true);
+        relocate_tool_cache_markers(&mut body);
+        assert_eq!(
+            body["messages"][2]["content"],
+            json!([{"type": "text", "text": "Reading it.", "cache_control": {"type": "ephemeral"}}])
+        );
+        assert_eq!(
+            body["messages"][3]["content"],
+            json!([{"type": "text", "text": "file contents"}])
+        );
+        // The system marker is untouched and no breakpoint was added.
+        assert_eq!(count_cache_control_blocks(&body), 2);
+    }
+
+    // A user message right after the tool results takes the marker, so the
+    // cached prefix runs through the tool results.
+    #[test]
+    fn tool_cache_marker_prefers_a_following_user_message() {
+        let mut body = tool_loop_body(true);
+        if let Some(messages) = body["messages"].as_array_mut() {
+            messages.push(json!({"role": "user", "content": [{"type": "text", "text": "go on"}]}));
+        }
+        relocate_tool_cache_markers(&mut body);
+        assert_eq!(
+            body["messages"][4]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(body["messages"][2]["content"], json!("Reading it."));
+        assert_eq!(count_cache_control_blocks(&body), 2);
+    }
+
+    // An assistant with only tool calls has nothing to anchor on, so the marker
+    // goes further back; an already-marked target keeps a single marker.
+    #[test]
+    fn tool_cache_marker_skips_contentless_assistants_and_never_duplicates() {
+        let mut body = tool_loop_body(true);
+        body["messages"][2]["content"] = Value::Null;
+        body["messages"][1]["content"] = json!([{
+            "type": "text",
+            "text": "read the file",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        }]);
+        relocate_tool_cache_markers(&mut body);
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(count_cache_control_blocks(&body), 2);
+    }
+
+    // Requests with no marker on a tool message serialize byte-for-byte unchanged,
+    // including markers the client put on other roles.
+    #[test]
+    fn bodies_without_tool_cache_markers_are_unchanged() -> serde_json::Result<()> {
+        for mut body in [tool_loop_body(false), request_body_without_markers()] {
+            let before = serde_json::to_vec(&body)?;
+            relocate_tool_cache_markers(&mut body);
+            assert_eq!(serde_json::to_vec(&body)?, before);
+        }
+        Ok(())
+    }
+
+    fn request_body_without_markers() -> Value {
+        json!({
+            "model": "gpt",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "c", "content": "ok"}
+            ]
+        })
+    }
+
+    // The request sent to an OpenAI Chat gateway carries the tool-loop
+    // breakpoint on a part the gateway turns into a cachePoint. The raw body is
+    // replayed exactly, which is the path the client's own markers take.
+    #[tokio::test]
+    async fn gateway_request_carries_the_tool_loop_breakpoint()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(chat_success_response())
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+
+        client
+            .call_rewrite_model_raw(
+                tool_loop_body(true),
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let sent: Value = serde_json::from_slice(
+            &received
+                .first()
+                .ok_or("expected one upstream request")?
+                .body,
+        )?;
+        assert_eq!(
+            sent["messages"][2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert!(!has_tool_cache_marker(&sent["messages"][3]));
+        assert_eq!(count_cache_control_blocks(&sent), 2);
+        Ok(())
+    }
+
+    // An unmarked agent-loop turn the way Turnstone sends it: string system
+    // prompt, skill as the first user message, an assistant turn with only tool
+    // calls, and a tool result last.
+    fn unmarked_agent_turn() -> Value {
+        json!({
+            "model": "gpt",
+            "tools": [
+                {"type": "function", "function": {"name": "read", "parameters": {}}},
+                {"type": "function", "function": {"name": "write", "parameters": {}}}
+            ],
+            "messages": [
+                {"role": "system", "content": "persona, policies, skills catalog"},
+                {"role": "user", "content": "applied skill"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "read", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "file contents"}
+            ]
+        })
+    }
+
+    // Auto breakpoints land on the system part, the last tool's function and,
+    // through relocation, the last stable message before the tool result.
+    #[test]
+    fn auto_cache_breakpoints_mark_system_last_tool_and_last_stable_message() {
+        let ephemeral = json!({"type": "ephemeral"});
+        let mut body = unmarked_agent_turn();
+        add_auto_cache_breakpoints(&mut body);
+        relocate_tool_cache_markers(&mut body);
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{
+                "type": "text",
+                "text": "persona, policies, skills catalog",
+                "cache_control": ephemeral
+            }])
+        );
+        assert_eq!(body["tools"][1]["function"]["cache_control"], ephemeral);
+        assert!(body["tools"][1].get("cache_control").is_none());
+        assert!(body["tools"][0]["function"].get("cache_control").is_none());
+        // The assistant has only tool calls, so the final message's marker
+        // moves back to the user message.
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            ephemeral
+        );
+        assert!(!has_tool_cache_marker(&body["messages"][3]));
+        assert_eq!(count_cache_control_blocks(&body), 3);
+    }
+
+    // On a first turn the final user message takes the marker; an array system
+    // prompt is marked on its last text part; no tools means two breakpoints.
+    #[test]
+    fn auto_cache_breakpoints_mark_a_final_user_message_and_array_system() {
+        let mut body = json!({
+            "model": "gpt",
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "persona"},
+                    {"type": "text", "text": "policies"}
+                ]},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        add_auto_cache_breakpoints(&mut body);
+        relocate_tool_cache_markers(&mut body);
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}])
+        );
+        assert_eq!(count_cache_control_blocks(&body), 2);
+    }
+
+    // A request that is only a system message gets one breakpoint, not two.
+    #[test]
+    fn auto_cache_breakpoints_never_mark_one_part_twice() {
+        let mut body = json!({"messages": [{"role": "system", "content": "sys"}]});
+        add_auto_cache_breakpoints(&mut body);
+        assert_eq!(count_cache_control_blocks(&body), 1);
+    }
+
+    // A request that already carries any marker serializes byte-for-byte
+    // unchanged: the caller's breakpoints are kept as they are.
+    #[test]
+    fn auto_cache_breakpoints_leave_marked_requests_unchanged() -> serde_json::Result<()> {
+        let mut tool_marked = unmarked_agent_turn();
+        tool_marked["tools"][0]["function"]["cache_control"] = json!({"type": "ephemeral"});
+        for mut body in [tool_loop_body(false), tool_loop_body(true), tool_marked] {
+            let before = serde_json::to_vec(&body)?;
+            add_auto_cache_breakpoints(&mut body);
+            assert_eq!(serde_json::to_vec(&body)?, before);
+        }
+        Ok(())
+    }
+
+    // Sends `body` exactly as a client would (raw replay) and returns what the
+    // OpenAI Chat upstream received.
+    async fn sent_chat_body(
+        auto_cache_breakpoints: bool,
+        body: Value,
+    ) -> std::result::Result<Value, Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(chat_success_response())
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&chat_map_with_auto_cache(
+            &format!("{}/v1", server.uri()),
+            auto_cache_breakpoints,
+        ))?;
+        client
+            .call_rewrite_model_raw(
+                body,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        Ok(serde_json::from_slice(
+            &received
+                .first()
+                .ok_or("expected one upstream request")?
+                .body,
+        )?)
+    }
+
+    // With the flag on, an unmarked request reaches the gateway with three
+    // breakpoints, all on parts the gateway turns into cachePoints.
+    #[tokio::test]
+    async fn auto_cache_breakpoints_flag_on_marks_unmarked_requests()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let sent = sent_chat_body(true, unmarked_agent_turn()).await?;
+        let ephemeral = json!({"type": "ephemeral"});
+        assert_eq!(
+            sent["messages"][0]["content"][0]["cache_control"],
+            ephemeral
+        );
+        assert_eq!(sent["tools"][1]["function"]["cache_control"], ephemeral);
+        assert_eq!(
+            sent["messages"][1]["content"][0]["cache_control"],
+            ephemeral
+        );
+        assert!(!has_tool_cache_marker(&sent["messages"][3]));
+        assert_eq!(count_cache_control_blocks(&sent), 3);
+        Ok(())
+    }
+
+    // With the flag off (the default), the same request reaches the upstream
+    // with no markers added and its string system prompt left a string.
+    #[tokio::test]
+    async fn auto_cache_breakpoints_flag_off_adds_nothing()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let sent = sent_chat_body(false, unmarked_agent_turn()).await?;
+        assert_eq!(count_cache_control_blocks(&sent), 0);
+        assert_eq!(
+            sent["messages"][0]["content"],
+            json!("persona, policies, skills catalog")
+        );
+        assert_eq!(sent["messages"][1]["content"], json!("applied skill"));
+        Ok(())
+    }
+
+    // With the flag on, a request that already has a marker keeps exactly its
+    // own breakpoint and gets no others.
+    #[tokio::test]
+    async fn auto_cache_breakpoints_flag_on_keeps_client_markers()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let sent = sent_chat_body(true, tool_loop_body(false)).await?;
+        assert_eq!(count_cache_control_blocks(&sent), 1);
+        assert_eq!(
+            sent["messages"][0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
         Ok(())
     }
 }

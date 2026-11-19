@@ -1779,6 +1779,7 @@ async fn client_call_keeps_attempt_target_through_retries() -> switchyard_libsy:
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 max_retries: 2,
+                auto_cache_breakpoints: false,
             }),
             None,
         )])

@@ -11,6 +11,7 @@ pub mod llm;
 pub mod metadata;
 pub mod model_id;
 pub mod stream;
+pub mod structured_output;
 pub mod telemetry;
 
 pub use client::*;
@@ -20,6 +21,7 @@ pub use llm::*;
 pub use metadata::*;
 pub use model_id::*;
 pub use stream::*;
+pub use structured_output::*;
 pub use telemetry::*;
 
 /// Builds a single-turn request: one user message carrying `prompt`, for `model`.

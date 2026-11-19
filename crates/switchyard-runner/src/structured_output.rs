@@ -16,17 +16,13 @@
 //! `{"type": "json_schema", "json_schema": {...}}`, so one rewrite covers all.
 
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::Value;
+pub use switchyard_protocol::STRUCTURED_OUTPUT_TOOL;
 use switchyard_protocol::{
     AggLlmResponse, ContentBlock, LlmClientError, LlmRequest, LlmResponse, LlmResponseChunk,
-    LlmResponseStreamEvent, PreservationMetadata, Response, StopReason, ToolChoice, ToolDefinition,
+    LlmResponseStreamEvent, PreservationMetadata, Response, StopReason, ToolChoice,
+    structured_output_tool,
 };
-
-/// Name of the tool that carries a structured response.
-pub const STRUCTURED_OUTPUT_TOOL: &str = "respond";
-
-const TOOL_DESCRIPTION: &str = "Give your complete final answer by calling this tool. \
-     The arguments are the whole response and must match the parameter schema.";
 
 /// Marks a request whose structured output was turned into a forced tool call.
 /// Use it to unwrap the response the route returns.
@@ -78,32 +74,21 @@ pub fn force_structured_output_tool(
     let Some(format) = request.output.response_format.as_ref() else {
         return Ok(None);
     };
-    let format_type = match format.get("type").and_then(Value::as_str) {
-        Some(kind @ ("json_schema" | "json_object")) => kind.to_string(),
-        _ => return Ok(None),
-    };
-    let (parameters, description, strict) = if format_type == "json_schema" {
-        json_schema_tool_parts(format)?
-    } else {
-        (
-            permissive_object_schema(),
-            TOOL_DESCRIPTION.to_string(),
-            None,
-        )
+    let Some(tool) = structured_output_tool(format)? else {
+        return Ok(None);
     };
     if !request.tools.is_empty() {
+        let format_type = format
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         return Err(invalid_request(format!(
             "response_format {format_type} cannot be combined with tools: structured output is \
              served through a forced tool call, so send either tools or response_format, not both"
         )));
     }
 
-    request.tools.push(ToolDefinition {
-        name: STRUCTURED_OUTPUT_TOOL.to_string(),
-        description: Some(description),
-        parameters,
-        strict,
-    });
+    request.tools.push(tool);
     request.tool_choice = Some(ToolChoice::Tool {
         name: STRUCTURED_OUTPUT_TOOL.to_string(),
     });
@@ -114,54 +99,6 @@ pub fn force_structured_output_tool(
     Ok(Some(ForcedStructuredOutput {
         tool: STRUCTURED_OUTPUT_TOOL.to_string(),
     }))
-}
-
-// Reads the tool parameters, description and strictness from a Chat-shaped
-// `{"type": "json_schema", "json_schema": {...}}` format.
-fn json_schema_tool_parts(format: &Value) -> Result<(Value, String, Option<bool>), LlmClientError> {
-    let spec = format.get("json_schema").and_then(Value::as_object);
-    let parameters = match spec.and_then(|spec| spec.get("schema")) {
-        None | Some(Value::Null) => permissive_object_schema(),
-        Some(Value::Object(schema)) => {
-            if let Some(kind) = schema
-                .get("type")
-                .and_then(Value::as_str)
-                .filter(|kind| *kind != "object")
-            {
-                return Err(invalid_request(format!(
-                    "response_format json_schema must describe an object (got type {kind}): \
-                     structured output is served through a tool call, whose arguments are an object"
-                )));
-            }
-            Value::Object(schema.clone())
-        }
-        Some(_) => {
-            return Err(invalid_request(
-                "response_format json_schema.schema must be a JSON object",
-            ));
-        }
-    };
-    let name = spec
-        .and_then(|spec| spec.get("name"))
-        .and_then(Value::as_str);
-    let description = match (
-        spec.and_then(|spec| spec.get("description"))
-            .and_then(Value::as_str),
-        name,
-    ) {
-        (Some(description), _) => format!("{TOOL_DESCRIPTION} {description}"),
-        (None, Some(name)) => format!("{TOOL_DESCRIPTION} The response is `{name}`."),
-        (None, None) => TOOL_DESCRIPTION.to_string(),
-    };
-    let strict = spec
-        .and_then(|spec| spec.get("strict"))
-        .and_then(Value::as_bool);
-    Ok((parameters, description, strict))
-}
-
-// `json_object` asks for any JSON object.
-fn permissive_object_schema() -> Value {
-    json!({"type": "object", "additionalProperties": true})
 }
 
 fn invalid_request(message: impl Into<String>) -> LlmClientError {
@@ -276,7 +213,10 @@ impl StreamUnwrap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use switchyard_protocol::{FormatId, ResponseOutput, Role, ToolCall, WireFormat, text_request};
+    use serde_json::json;
+    use switchyard_protocol::{
+        FormatId, ResponseOutput, Role, ToolCall, ToolDefinition, WireFormat, text_request,
+    };
 
     fn schema() -> Value {
         json!({
@@ -360,7 +300,10 @@ mod tests {
         request.tool_choice = Some(ToolChoice::Auto);
         let forced = force_structured_output_tool(&mut request).expect("json_object is valid");
         assert!(forced.is_some());
-        assert_eq!(request.tools[0].parameters, permissive_object_schema());
+        assert_eq!(
+            request.tools[0].parameters,
+            json!({"type": "object", "additionalProperties": true})
+        );
         assert_eq!(request.tools[0].strict, None);
         assert_eq!(
             request.tool_choice,

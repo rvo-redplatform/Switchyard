@@ -59,6 +59,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Hierarchical routing** — libsy adds hierarchical routing, with stages
   delegating to their own sub-router; a hierarchical stage router that
   carries its own judge is rejected. (#533)
+- **Automatic prompt-cache breakpoints** — `auto_cache_breakpoints = true`
+  on an `openai_chat` client marks requests that carry no `cache_control`
+  with at most three breakpoints: the last system message, the last tool
+  definition, and the final message. Off by default.
 
 ### Changed
 

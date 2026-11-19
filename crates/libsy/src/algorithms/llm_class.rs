@@ -1589,9 +1589,23 @@ mod tests {
         assert!(contents.contains(&"initial task".to_string()));
         assert!(!contents.contains(&"recent 5".to_string()));
         assert!(!contents.contains(&"client instructions".to_string()));
+        // The verdict schema travels as the only tool, and the judge is forced to call it.
+        assert_eq!(judge_request.llm_request.output.response_format, None);
+        assert_eq!(judge_request.llm_request.tools.len(), 1);
+        let tool = &judge_request.llm_request.tools[0];
+        assert_eq!(tool.name, switchyard_protocol::STRUCTURED_OUTPUT_TOOL);
         assert_eq!(
-            judge_request.llm_request.output.response_format,
-            Some(judge.contract().response_format().clone())
+            Some(&tool.parameters),
+            judge
+                .contract()
+                .response_format()
+                .pointer("/json_schema/schema")
+        );
+        assert_eq!(
+            judge_request.llm_request.tool_choice,
+            Some(switchyard_protocol::ToolChoice::Tool {
+                name: switchyard_protocol::STRUCTURED_OUTPUT_TOOL.to_string()
+            })
         );
         assert_eq!(
             judge_request.llm_request.output.max_output_tokens,

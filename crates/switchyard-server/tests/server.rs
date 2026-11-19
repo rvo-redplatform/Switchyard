@@ -310,8 +310,12 @@ async fn upstream_chat(
         .into_response();
     }
 
-    let custom_target_schema = body
-        .pointer("/response_format/json_schema/schema/properties/decision/properties/target")
+    // Judges send their verdict schema as the forced tool's parameters.
+    let verdict_schema = body
+        .pointer("/tools/0/function/parameters")
+        .or_else(|| body.pointer("/response_format/json_schema/schema"));
+    let custom_target_schema = verdict_schema
+        .and_then(|schema| schema.pointer("/properties/decision/properties/target"))
         .is_some();
     let requests_invalid_verdict = body["messages"].as_array().is_some_and(|messages| {
         messages.iter().any(|message| {
@@ -334,8 +338,8 @@ async fn upstream_chat(
             r#"{"decision":{"target":"premium"}}"#
         }
     } else if model == "model/classifier"
-        && body
-            .pointer("/response_format/json_schema/schema/properties/escalate")
+        && verdict_schema
+            .and_then(|schema| schema.pointer("/properties/escalate"))
             .is_some()
     {
         r#"{"escalate":false,"reason":"making progress"}"#
@@ -496,6 +500,7 @@ fn random_state_with_retries(
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
         max_retries,
+        auto_cache_breakpoints: false,
     });
     let target_models = routes
         .iter()
@@ -1460,15 +1465,19 @@ selector = "/decision/target"
         .as_str()
         .ok_or("custom classifier prompt was not text")?;
     assert_eq!(prompt, "CUSTOM MULTI TARGET");
-    assert_eq!(judge_call["response_format"]["type"], "json_schema");
-    assert_eq!(
-        judge_call["response_format"]["json_schema"]["name"],
-        "switchyard_classifier_response"
+    assert!(judge_call.get("response_format").is_none(), "{judge_call}");
+    assert_eq!(judge_call["tool_choice"]["function"]["name"], "respond");
+    let tool = &judge_call["tools"][0]["function"];
+    assert_eq!(tool["name"], "respond");
+    assert!(
+        tool["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("switchyard_classifier_response")),
+        "{tool}"
     );
-    assert_eq!(judge_call["response_format"]["json_schema"]["strict"], true);
+    assert_eq!(tool["strict"], true);
     assert_eq!(
-        judge_call["response_format"]["json_schema"]["schema"]["properties"]["decision"]["properties"]
-            ["target"]["enum"],
+        tool["parameters"]["properties"]["decision"]["properties"]["target"]["enum"],
         json!(["weak", "middle", "strong", "premium"])
     );
     Ok(())
@@ -1574,9 +1583,13 @@ prompt = "CUSTOM STAGE"
             .ok_or("classifier prompt was not text")?;
         assert!(prompt.starts_with(prompt_prefix), "{route}: {prompt}");
         if json_object {
+            assert!(
+                judge_call.get("response_format").is_none(),
+                "{route}: {judge_call}"
+            );
             assert_eq!(
-                judge_call["response_format"],
-                json!({"type": "json_object"}),
+                judge_call["tools"][0]["function"]["parameters"],
+                json!({"type": "object", "additionalProperties": true}),
                 "{route}: {judge_call}"
             );
             assert!(prompt.contains("JSON Schema"), "{route}: {prompt}");
@@ -1586,7 +1599,7 @@ prompt = "CUSTOM STAGE"
             );
         } else {
             assert!(
-                judge_call["response_format"]["json_schema"]["schema"]["properties"]
+                judge_call["tools"][0]["function"]["parameters"]["properties"]
                     .get(schema_field)
                     .is_some(),
                 "{route}: missing {schema_field} in {judge_call}"
@@ -1730,10 +1743,8 @@ response_format_type = "json_object"
         .iter()
         .find(|call| call["model"] == "model/classifier")
         .ok_or("classifier target was not called")?;
-    assert_eq!(
-        judge_call["response_format"],
-        json!({"type": "json_object"})
-    );
+    assert!(judge_call.get("response_format").is_none(), "{judge_call}");
+    assert_eq!(judge_call["tool_choice"]["function"]["name"], "respond");
     let prompt = judge_call["messages"][0]["content"]
         .as_str()
         .ok_or("classifier prompt was not text")?;

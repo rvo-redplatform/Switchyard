@@ -763,6 +763,7 @@ mod tests {
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 max_retries: 2,
+                auto_cache_breakpoints: false,
             })
         };
         let client = Arc::new(
@@ -854,6 +855,7 @@ mod tests {
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 max_retries: 0,
+                auto_cache_breakpoints: false,
             })
         };
         let client = Arc::new(
