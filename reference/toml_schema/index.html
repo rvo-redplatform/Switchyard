@@ -1080,6 +1080,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="[llm_clients.&lt;name&gt;]">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#automatic-cache-breakpoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Automatic cache breakpoints
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1289,6 +1306,23 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="[llm_clients.&lt;name&gt;]">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#automatic-cache-breakpoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Automatic cache breakpoints
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1504,6 +1538,12 @@ route reaches no upstream. A file without a <code>[targets]</code> table is reje
 <td><code>2</code></td>
 <td>Retry budget, <code>0</code>–<code>10</code>.</td>
 </tr>
+<tr>
+<td><code>auto_cache_breakpoints</code></td>
+<td style="text-align: center;">No</td>
+<td><code>false</code></td>
+<td><code>openai_chat</code> only: add prompt-cache breakpoints to requests that carry no <code>cache_control</code>. See <a href="#automatic-cache-breakpoints">Automatic cache breakpoints</a>.</td>
+</tr>
 </tbody>
 </table>
 <p>The TOML never contains the secret itself. <code>api_key_env</code> names a variable that
@@ -1527,6 +1567,29 @@ forwarding client used by a route, including classifier and judge targets. The
 server rejects an Anthropic forwarding route called through an OpenAI endpoint,
 or an OpenAI forwarding route called through an Anthropic endpoint, before it
 calls an upstream.</p>
+<h3 id="automatic-cache-breakpoints">Automatic cache breakpoints<a class="headerlink" href="#automatic-cache-breakpoints" title="Permanent link">&para;</a></h3>
+<p>Some clients never mark their prompts for caching, so a gateway that caches
+only marked content (such as Envoy AI Gateway in front of Bedrock) never
+caches them. Set <code>auto_cache_breakpoints = true</code> on an <code>openai_chat</code> client to
+mark such requests:</p>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">[llm_clients.gateway]</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="n">format</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;openai_chat&quot;</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="n">base_url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;http://gateway.example/v1&quot;</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">auto_cache_breakpoints</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+</span></code></pre></div>
+<p>A request that has no <code>cache_control</code> marker anywhere gets at most three
+<code>{"type": "ephemeral"}</code> markers:</p>
+<ol>
+<li>the last <code>system</code> or <code>developer</code> message. String content becomes a single
+   text part, because a gateway does not cache string system content.</li>
+<li>the last tool definition, at <code>tools[-1].function.cache_control</code>.</li>
+<li>the final message. When that is a <code>role: tool</code> result, the marker moves to
+   the next or the previous user or assistant part, the same way a client's
+   own tool-result marker moves.</li>
+</ol>
+<p>A request that already has any marker is sent unchanged, and the other formats
+ignore this key. Cache writes are billed above the plain input rate, so enable
+it only for clients whose requests repeat a long prefix.</p>
 <h2 id="targetsname"><code>[targets.&lt;name&gt;]</code><a class="headerlink" href="#targetsname" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1607,13 +1670,13 @@ calls an upstream.</p>
 upstream model. Use it for local smoke tests.</p>
 <p>A noop-only deployment reaches no upstream but still needs the <code>[targets]</code>
 table, which can be empty:</p>
-<div class="language-toml highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">schema_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="k">[targets]</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
-</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="k">[routes.smoke]</span>
-</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;noop-route&quot;</span>
-</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;noop&quot;</span>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">schema_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="k">[targets]</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="k">[routes.smoke]</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;noop-route&quot;</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;noop&quot;</span>
 </span></code></pre></div>
 <h3 id="passthrough"><code>passthrough</code><a class="headerlink" href="#passthrough" title="Permanent link">&para;</a></h3>
 <p>Sends parent requests to one target. It can also route delegated sub-agent work;
